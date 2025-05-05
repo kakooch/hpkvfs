@@ -180,7 +180,7 @@ static long perform_hpkv_request(
     curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)response_chunk);
-    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "hpkvfs/0.1.2"); // Version bump
+    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "hpkvfs/0.1.3"); // Version bump
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connection timeout
     curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 60L);      // 60 seconds total timeout (increased for potentially larger ops)
     // Consider adding CURLOPT_FOLLOWLOCATION, 1L if redirects are expected/needed
@@ -679,7 +679,7 @@ static int hpkv_getattr(const char *path, struct stat *stbuf) {
     return ret;
 }
 
-// readdir: Read directory contents (Modified to filter chunk keys)
+// readdir: Read directory contents (Modified to filter chunk keys and skip empty root entry)
 static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
     DEBUG_LOG("hpkv_readdir: Called for path: %s, offset: %ld\n", path, offset);
     (void) offset; (void) fi;
@@ -709,9 +709,9 @@ static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
         return 0;
     }
 
-    // Function to add entry if not already present
+    // Function to add entry if not already present and not empty
     void add_entry(const char *name) {
-        if (!already_added(name) && added_count < MAX_DIR_ENTRIES) {
+        if (name && name[0] != '\0' && !already_added(name) && added_count < MAX_DIR_ENTRIES) {
             strncpy(added_entries[added_count], name, 255);
             added_entries[added_count][255] = '\0'; // Ensure null termination
             filler(buf, name, NULL, 0);
@@ -719,7 +719,7 @@ static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
         }
     }
 
-    DEBUG_LOG("hpkv_readdir(%s): Adding '.' and '..'\n", path); // Fixed syntax
+    DEBUG_LOG("hpkv_readdir(%s): Adding '.' and '..'\n", path);
     add_entry(".");
     add_entry("..");
 
@@ -801,8 +801,13 @@ static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
                     if (base_len < sizeof(current_entry)) {
                         strncpy(current_entry, entry_name_ptr, base_len);
                         current_entry[base_len] = '\0';
-                        DEBUG_LOG("hpkv_readdir(%s): Adding entry from metadata: %s\n", path, current_entry);
-                        add_entry(current_entry); // Add the file/dir name
+                        // *** FIX: Check if the extracted name is empty before adding ***
+                        if (current_entry[0] != '\0') {
+                            DEBUG_LOG("hpkv_readdir(%s): Adding entry from metadata: %s\n", path, current_entry);
+                            add_entry(current_entry); // Add the file/dir name
+                        } else {
+                            DEBUG_LOG("hpkv_readdir(%s): Skipping empty entry derived from metadata key: %s\n", path, full_key);
+                        }
                     } else {
                          fprintf(stderr, "Warning: hpkv_readdir(%s): Base name too long from metadata: %.*s...\n", path, (int)sizeof(current_entry)-1, entry_name_ptr);
                     }
@@ -1467,7 +1472,7 @@ static int hpkv_unlink(const char *path) {
     http_code_meta = perform_hpkv_request_with_retry("DELETE", api_path_meta, NULL, NULL, 0, &response_meta, 3);
     if (response_meta.memory) {
         free(response_meta.memory);
-        response_meta.memory = NULL; // Fix indentation warning
+        response_meta.memory = NULL;
     }
     ret_meta = map_http_to_fuse_error(http_code_meta);
     if (ret_meta != 0 && ret_meta != -ENOENT) {
@@ -1671,7 +1676,7 @@ int main(int argc, char *argv[]) {
     hpkv_config config = {0};
     int ret;
 
-    fprintf(stderr, "Starting HPKV FUSE filesystem (hpkvfs v0.1.2 - Chunking).\n");
+    fprintf(stderr, "Starting HPKV FUSE filesystem (hpkvfs v0.1.3 - readdir fix).\n");
 
     if (fuse_opt_parse(&args, &options, hpkv_opts, hpkv_opt_proc) == -1) {
         fprintf(stderr, "Error: Failed to parse FUSE options.\n");

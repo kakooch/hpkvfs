@@ -8,7 +8,7 @@
 
 This enables accessing and manipulating data stored in HPKV using standard command-line tools (`ls`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `echo`, etc.) and applications, providing a familiar interface to a powerful key-value storage backend.
 
-**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. Runtime validation of this chunking logic is **pending**. Previous attempts showed successful mounting and file creation, but write operations failed due to the size limit. This version *should* address the write issue, but requires testing.
+**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. File operations (read, write, create, delete) appear functional based on user testing. Fixed an issue in `readdir` that caused `ls` to fail with an "Input/output error" by preventing empty entry names from being added. Further testing is recommended.
 
 ## Platform Support
 
@@ -24,7 +24,7 @@ This enables accessing and manipulating data stored in HPKV using standard comma
 *   **File Chunking:** Splits files larger than ~3KB into multiple chunks stored as separate keys (`<path>.chunkN`) to overcome API value size limits.
 *   **Standard Filesystem Operations:** Supports core operations including:
     *   `getattr` (Get file/directory attributes)
-    *   `readdir` (List directory contents)
+    *   `readdir` (List directory contents - *Fixed I/O error*)
     *   `mkdir` (Create directories)
     *   `rmdir` (Remove empty directories - *Note: Emptiness check currently not implemented*)
     *   `create` (Create new empty files)
@@ -193,7 +193,6 @@ For more detailed information on the design choices and implementation strategy 
 
 ## Limitations & Known Issues
 
-*   **Chunking Validation Pending:** The file chunking logic has been implemented but requires runtime testing to confirm it correctly handles reads, writes, and truncates for files larger than the API limit.
 *   **Experimental Platforms:** macOS support is experimental. Windows is unsupported.
 *   **Atomicity:** The `rename` operation is not atomic. It involves copying data/metadata to the new location and then deleting the old location. An interruption during this process could lead to an inconsistent state.
 *   **`rmdir` Emptiness Check:** The current implementation of `rmdir` does not check if a directory is empty before attempting deletion via the API. This might lead to unexpected behavior or errors if the directory is not empty.
