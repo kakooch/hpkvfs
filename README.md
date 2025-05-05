@@ -8,6 +8,8 @@
 
 This enables accessing and manipulating data stored in HPKV using standard command-line tools (`ls`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `echo`, etc.) and applications, providing a familiar interface to a powerful key-value storage backend.
 
+**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. Runtime validation of this chunking logic is **pending**. Previous attempts showed successful mounting and file creation, but write operations failed due to the size limit. This version *should* address the write issue, but requires testing.
+
 ## Platform Support
 
 *   **Linux (Primary & Tested):** Developed and tested primarily on Linux (Ubuntu). Requires `libfuse`.
@@ -19,22 +21,23 @@ This enables accessing and manipulating data stored in HPKV using standard comma
 *   **Mount HPKV as Filesystem:** Access your HPKV data through a standard directory structure (Linux, experimental macOS).
 *   **REST API Integration:** Communicates directly with the HPKV REST API.
 *   **API Key Authentication:** Securely authenticates using your HPKV API key via the `x-api-key` header.
+*   **File Chunking:** Splits files larger than ~3KB into multiple chunks stored as separate keys (`<path>.chunkN`) to overcome API value size limits.
 *   **Standard Filesystem Operations:** Supports core operations including:
     *   `getattr` (Get file/directory attributes)
     *   `readdir` (List directory contents)
     *   `mkdir` (Create directories)
     *   `rmdir` (Remove empty directories - *Note: Emptiness check currently not implemented*)
     *   `create` (Create new empty files)
-    *   `open` (Open files)
-    *   `read` (Read file content)
-    *   `write` (Write file content - *overwrites/extends*)
-    *   `truncate` (Change file size)
-    *   `unlink` (Delete files)
-    *   `rename` (Rename/move files and directories - *Note: Not atomic*)
+    *   `open` (Open files, handles `O_TRUNC`)
+    *   `read` (Read file content, handles chunking)
+    *   `write` (Write file content, handles chunking)
+    *   `truncate` (Change file size, handles chunking)
+    *   `unlink` (Delete files, handles chunking)
+    *   `rename` (Rename/move files and directories, handles chunking - *Note: Not atomic*)
     *   `chmod` (Change permissions)
     *   `chown` (Change owner/group - *requires appropriate system permissions, limited on macOS/Windows*)
     *   `utimens` (Change access/modification times)
-*   **Metadata Storage:** Stores filesystem metadata (mode, size, timestamps, owner) alongside content in HPKV using dedicated keys.
+*   **Metadata Storage:** Stores filesystem metadata (mode, size, timestamps, owner, chunk info) alongside content in HPKV using dedicated keys (`<path>.__meta__`).
 *   **Error Handling:** Maps HPKV API errors to standard POSIX filesystem errors.
 *   **Retry Logic:** Implements basic retry logic with exponential backoff for transient API errors (e.g., rate limits, server errors).
 *   **CMake Build System:** Uses CMake for cross-platform building (Linux, experimental macOS).
@@ -131,34 +134,40 @@ This project uses CMake. You can use the provided build script or follow the man
     ```bash
     mkdir ~/my_hpkv_drive
     ```
-3.  **Mount:** Run `hpkvfs` with the mount point, API key, and API URL.
+3.  **Initialize Root (Important!):** Before the first mount, ensure the root metadata exists in HPKV. Use `curl` or another tool to create the key `/.__meta__` with a value like:
+    ```json
+    {"mode": 16877, "uid": 1000, "gid": 1000, "size": 0, "atime": 1714902307, "mtime": 1714902307, "ctime": 1714902307}
+    ```
+    (Replace UID/GID/timestamps as needed. The value must be a JSON *string* when using the API directly).
+4.  **Mount:** Run `hpkvfs` with the mount point, API key, and API URL.
     ```bash
     # From build directory:
     ./build/hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     # If installed:
     hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     ```
-4.  **Unmount:**
+5.  **Unmount:**
     *   Foreground (`-f`): Press `Ctrl+C`.
     *   Background: `fusermount -u ~/my_hpkv_drive`
 
 **macOS (Experimental):**
 1.  **Install macFUSE:** Ensure macFUSE is installed and kernel extension is allowed.
 2.  **Create Mount Point:** `mkdir ~/my_hpkv_drive`
-3.  **Mount:** Similar to Linux, using the compiled `hpkvfs` binary.
+3.  **Initialize Root:** See step 3 under Linux usage.
+4.  **Mount:** Similar to Linux, using the compiled `hpkvfs` binary.
     ```bash
     ./build/hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     ```
     *Note: Standard FUSE options like `-o allow_other` might require specific macFUSE configuration.* 
-4.  **Unmount:**
+5.  **Unmount:**
     *   Foreground (`-f`): Press `Ctrl+C`.
     *   Background: `umount ~/my_hpkv_drive` or `diskutil unmount ~/my_hpkv_drive`
 
 **Common FUSE Options:**
 *   `-f`: Run in the foreground (useful for debugging).
 *   `-s`: Run single-threaded (can help with debugging).
+*   `-d`: Enable FUSE-level debug messages (very verbose).
 *   `-o allow_other`: Allow other users access (requires `user_allow_other` in `/etc/fuse.conf` on Linux, or specific macFUSE settings).
-*   `-o debug`: Enable FUSE-level debug messages.
 
 **HPKVFS Options:**
 *   `--api-key=<key>`: (Required) Your HPKV API key.
@@ -166,7 +175,7 @@ This project uses CMake. You can use the provided build script or follow the man
 
 **Example:**
 ```bash
-./build/hpkvfs ~/my_hpkv_drive --api-key=d2e022c1d3b94b3180f5179da422d437 --api-url=https://api-eu-1.hpkv.io -f
+./build/hpkvfs ~/my_hpkv_drive --api-key=d2e022c1d3b94b3180f5179da422d437 --api-url=https://api-eu-1.hpkv.io -f -d
 ```
 
 ## Design & Implementation
@@ -175,24 +184,23 @@ This project uses CMake. You can use the provided build script or follow the man
 *   **Build System:** CMake
 *   **Core Libraries:** `libfuse` (Linux) / `macFUSE` (macOS), `libcurl`, `jansson`.
 *   **Key Mapping:**
-    *   File content for `/path/to/file` is stored under the key `/path/to/file`.
-    *   Metadata (mode, size, uid, gid, atime, mtime, ctime) for `/path/to/object` is stored as a JSON string under the key `/path/to/object.__meta__`.
-    *   Directories do not have a content key; their existence is defined by their metadata key.
+    *   Metadata (mode, size, uid, gid, atime, mtime, ctime, num_chunks, chunk_size) for `/path/to/object` is stored as a JSON string under the key `/path/to/object.__meta__`.
+    *   File content for `/path/to/file` is split into chunks (default ~3KB) and stored under keys like `/path/to/file.chunk0`, `/path/to/file.chunk1`, etc.
+    *   Directories do not have content keys; their existence is defined by their metadata key.
 *   **API Interaction:** All filesystem operations are mapped to HPKV REST API calls (`GET`, `POST`, `DELETE`).
 
 For more detailed information on the design choices and implementation strategy for each FUSE operation, please refer to the `hpkvfs_design.md` document included in this repository.
 
 ## Limitations & Known Issues
 
-*   **Debugging Status:** The current version has known issues with mounting and basic operations (like `ls`) that are still under investigation. Use with caution.
+*   **Chunking Validation Pending:** The file chunking logic has been implemented but requires runtime testing to confirm it correctly handles reads, writes, and truncates for files larger than the API limit.
 *   **Experimental Platforms:** macOS support is experimental. Windows is unsupported.
 *   **Atomicity:** The `rename` operation is not atomic. It involves copying data/metadata to the new location and then deleting the old location. An interruption during this process could lead to an inconsistent state.
 *   **`rmdir` Emptiness Check:** The current implementation of `rmdir` does not check if a directory is empty before attempting deletion via the API. This might lead to unexpected behavior or errors if the directory is not empty.
-*   **Performance:** Performance is directly tied to the latency and throughput of the HPKV REST API. Operations involving multiple API calls (like `write`, `truncate`, `rename`, `readdir`) may be significantly slower than local filesystem operations.
-*   **Large Files:** The current `write` and `truncate` implementations read the entire file content into memory, modify it, and write it back. This is highly inefficient for large files.
-*   **Binary Data:** While efforts were made to handle binary data using `json_stringn` and size information from metadata, thorough testing across various binary file types is recommended, especially regarding JSON encoding/decoding.
-*   **Error Handling:** While basic error mapping and retries are implemented, complex failure scenarios or specific HPKV error conditions might require more sophisticated handling.
-*   **Concurrency:** No explicit locking is implemented. Concurrent operations from multiple clients or processes might lead to race conditions or inconsistent states.
+*   **Performance:** Performance is directly tied to the latency and throughput of the HPKV REST API. Operations involving multiple API calls (like `write`, `truncate`, `rename`, `readdir`, especially with chunking) may be significantly slower than local filesystem operations.
+*   **Binary Data:** While efforts were made to handle binary data using `json_stringn` and size information from metadata, thorough testing across various binary file types is recommended, especially regarding JSON encoding/decoding within chunks.
+*   **Error Handling:** While basic error mapping and retries are implemented, complex failure scenarios or specific HPKV error conditions might require more sophisticated handling, especially during multi-chunk operations.
+*   **Concurrency:** No explicit locking is implemented. Concurrent operations from multiple clients or processes might lead to race conditions or inconsistent states, particularly when modifying the same file's chunks or metadata.
 
 ## License
 
@@ -205,5 +213,6 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 ## Contributing
 
 Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request on the [GitHub repository](https://github.com/kakooch/hpkvfs).
+
 
 
