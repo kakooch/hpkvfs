@@ -31,40 +31,54 @@ This enables accessing and manipulating data stored in HPKV using standard comma
 *   **Metadata Storage:** Stores filesystem metadata (mode, size, timestamps, owner) alongside content in HPKV using dedicated keys.
 *   **Error Handling:** Maps HPKV API errors to standard POSIX filesystem errors.
 *   **Retry Logic:** Implements basic retry logic with exponential backoff for transient API errors (e.g., rate limits, server errors).
+*   **CMake Build System:** Uses CMake for robust building and installation.
 
 ## Dependencies
 
-To build and run `hpkvfs`, you need the following:
+To build and run `hpkvfs`, you need the following development packages:
 
-1.  **`libfuse-dev`:** Development files for FUSE (Filesystem in Userspace).
-2.  **`libcurl4-openssl-dev` (or similar):** Development files for the cURL library (used for HTTP requests).
-3.  **`libjansson-dev`:** Development files for the Jansson library (used for JSON parsing).
-4.  **`gcc`:** A C compiler.
-5.  **`make`:** The build utility.
-6.  **`pkg-config`:** Helper tool to get compiler/linker flags.
+1.  **`cmake`:** Cross-platform build system generator.
+2.  **`pkg-config`:** Helper tool to get compiler/linker flags.
+3.  **`libfuse-dev`:** Development files for FUSE (Filesystem in Userspace).
+4.  **`libcurl4-openssl-dev` (or similar):** Development files for the cURL library (used for HTTP requests).
+5.  **`libjansson-dev`:** Development files for the Jansson library (used for JSON parsing).
+6.  **A C Compiler:** Such as `gcc` or `clang`.
+7.  **`make` or `ninja-build`:** A build tool that CMake can generate files for.
 
 On **Debian/Ubuntu-based systems**, you can install these using:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y fuse libfuse-dev libcurl4-openssl-dev libjansson-dev gcc make pkg-config
+sudo apt-get install -y cmake pkg-config fuse libfuse-dev libcurl4-openssl-dev libjansson-dev build-essential
 ```
+*Note: `build-essential` typically includes `gcc` and `make`.*
 
 ## Building
 
-A `Makefile` is provided for easy compilation. Simply run:
+This project uses CMake. The standard build process is as follows:
 
-```bash
-make
-```
+1.  **Create a build directory:** It's best practice to build outside the source directory.
+    ```bash
+    mkdir build
+    cd build
+    ```
 
-This will compile `hpkvfs.c` and create the executable binary `hpkvfs` in the current directory.
+2.  **Configure using CMake:** Run CMake to configure the project and generate build files (e.g., Makefiles).
+    ```bash
+    cmake ..
+    ```
+    *   You can specify an installation prefix here if desired: `cmake .. -DCMAKE_INSTALL_PREFIX=/path/to/install`
 
-To clean the build artifacts, run:
+3.  **Compile:** Run the build tool (usually `make`).
+    ```bash
+    make
+    ```
+    This will create the `hpkvfs` executable in the `build` directory.
 
-```bash
-make clean
-```
+4.  **(Optional) Install:** To install the `hpkvfs` binary to the configured installation path (default: `/usr/local/bin`), run:
+    ```bash
+    sudo make install
+    ```
 
 ## Usage
 
@@ -78,9 +92,13 @@ make clean
     mkdir ~/my_hpkv_drive
     ```
 
-3.  **Mount the Filesystem:** Run the `hpkvfs` executable, providing the mount point, your HPKV API key, and the HPKV REST API base URL.
+3.  **Mount the Filesystem:** Run the `hpkvfs` executable (either from the build directory or the installed location), providing the mount point, your HPKV API key, and the HPKV REST API base URL.
     ```bash
+    # If running from build directory:
     ./hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
+    
+    # If installed:
+    hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     ```
     *   Replace `<YOUR_HPKV_API_KEY>` with your actual API key.
     *   Replace `<YOUR_HPKV_API_URL>` with the base URL for your HPKV instance (e.g., `https://api-eu-1.hpkv.io`).
@@ -106,6 +124,7 @@ make clean
 ## Design & Implementation
 
 *   **Language:** C
+*   **Build System:** CMake
 *   **Core Libraries:** `libfuse` (v2.6+), `libcurl`, `jansson`.
 *   **Key Mapping:**
     *   File content for `/path/to/file` is stored under the key `/path/to/file`.
