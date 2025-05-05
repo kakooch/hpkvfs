@@ -8,7 +8,7 @@
 
 This enables accessing and manipulating data stored in HPKV using standard command-line tools (`ls`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `echo`, etc.) and applications, providing a familiar interface to a powerful key-value storage backend.
 
-**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. File operations (read, write, create, delete) appear functional based on user testing. Fixed an issue in `readdir` that caused `ls` to fail with an "Input/output error" by preventing empty entry names from being added. Packaged for Debian/Ubuntu (`.deb`). Further testing is recommended.
+**Current Status:** Implemented automatic root directory initialization on first mount. Implemented file chunking to support files larger than the HPKV API's 3KB value limit. File operations (read, write, create, delete) and directory listing (`ls`) appear functional based on user testing. Packaged for Debian/Ubuntu (`.deb`). Further testing is recommended.
 
 ## Platform Support
 
@@ -21,10 +21,11 @@ This enables accessing and manipulating data stored in HPKV using standard comma
 *   **Mount HPKV as Filesystem:** Access your HPKV data through a standard directory structure (Linux, experimental macOS).
 *   **REST API Integration:** Communicates directly with the HPKV REST API.
 *   **API Key Authentication:** Securely authenticates using your HPKV API key via the `x-api-key` header.
+*   **Automatic Root Initialization:** Automatically creates the necessary root directory metadata (`/.__meta__`) in HPKV on the first mount if it doesn't exist, simplifying setup.
 *   **File Chunking:** Splits files larger than ~3KB into multiple chunks stored as separate keys (`<path>.chunkN`) to overcome API value size limits.
 *   **Standard Filesystem Operations:** Supports core operations including:
     *   `getattr` (Get file/directory attributes)
-    *   `readdir` (List directory contents - *Fixed I/O error*)
+    *   `readdir` (List directory contents)
     *   `mkdir` (Create directories)
     *   `rmdir` (Remove empty directories - *Note: Emptiness check currently not implemented*)
     *   `create` (Create new empty files)
@@ -143,19 +144,14 @@ This project uses CMake. You can use the provided build script or follow the man
     ```bash
     mkdir ~/my_hpkv_drive
     ```
-3.  **Initialize Root (Important!):** Before the first mount, ensure the root metadata exists in HPKV. Use `curl` or another tool to create the key `/.__meta__` with a value like:
-    ```json
-    {"mode": 16877, "uid": 1000, "gid": 1000, "size": 0, "atime": 1714902307, "mtime": 1714902307, "ctime": 1714902307}
-    ```
-    (Replace UID/GID/timestamps as needed. The value must be a JSON *string* when using the API directly).
-4.  **Mount:** Run `hpkvfs` with the mount point, API key, and API URL.
+3.  **Mount:** Run `hpkvfs` with the mount point, API key, and API URL. The filesystem will automatically create the root directory metadata in HPKV if it's the first time mounting.
     ```bash
     # If installed via .deb package:
 hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     # If built from source:
     ./build/hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     ```
-5.  **Unmount:**
+4.  **Unmount:**
     *   Foreground (`-f`): Press `Ctrl+C`.
     *   Background: `fusermount -u ~/my_hpkv_drive`
 
@@ -206,11 +202,9 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 
 ## Author
 
-*   **kakooch**
+*   **Kaveh Kakooch <kakooch@gmail.com>**
 
 ## Contributing
 
 Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request on the [GitHub repository](https://github.com/kakooch/hpkvfs).
-
-
 

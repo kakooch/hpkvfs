@@ -1,3 +1,10 @@
+hpkvfs (0.1.3-2) jammy; urgency=medium
+
+  * Implement automatic root directory initialization on first mount.
+  * Update README to reflect auto-init feature.
+
+ -- Kaveh Kakooch <kakooch@gmail.com>  Mon, 05 May 2025 11:30:00 +0000
+
 hpkvfs (0.1.3-1) jammy; urgency=medium
 
   * Initial release.

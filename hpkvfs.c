@@ -6,6 +6,7 @@
  * Windows support requires significant porting (Dokan/WinFsp).
  * 
  * Implements file chunking to handle API value size limits.
+ * Automatically initializes root directory metadata if missing.
  ******************************************************************************/
 
 // Define FUSE version before including fuse.h
@@ -60,7 +61,10 @@ typedef struct {
     char *api_key;
 } hpkv_config;
 
-// Get private data from FUSE context
+// Global pointer for config, needed for early init check
+static hpkv_config global_hpkv_config;
+
+// Get private data from FUSE context (use global_hpkv_config for early init)
 #define HPKV_DATA ((hpkv_config *) fuse_get_context()->private_data)
 
 // Structure to hold command line options (parsed by FUSE)
@@ -173,20 +177,22 @@ static long perform_hpkv_request(
     }
 
     // Construct full URL
-    snprintf(full_url, sizeof(full_url), "%s%s", HPKV_DATA->api_base_url, path_segment);
+    // Use global config here as FUSE context might not be ready during early init
+    snprintf(full_url, sizeof(full_url), "%s%s", global_hpkv_config.api_base_url, path_segment);
     DEBUG_LOG("perform_hpkv_request: Full URL=%s\n", full_url);
 
     // Set common options
     curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)response_chunk);
-    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "hpkvfs/0.1.3"); // Version bump
+    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "hpkvfs/0.1.4"); // Version bump
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connection timeout
     curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 60L);      // 60 seconds total timeout (increased for potentially larger ops)
     // Consider adding CURLOPT_FOLLOWLOCATION, 1L if redirects are expected/needed
 
     // Set headers
-    snprintf(api_key_header, sizeof(api_key_header), "x-api-key: %s", HPKV_DATA->api_key);
+    // Use global config here as FUSE context might not be ready during early init
+    snprintf(api_key_header, sizeof(api_key_header), "x-api-key: %s", global_hpkv_config.api_key);
     headers = curl_slist_append(headers, api_key_header);
     if (request_body || request_body_n) {
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -306,7 +312,7 @@ static void get_meta_key(const char *path, char *meta_key_buf, size_t buf_size) 
         snprintf(meta_key_buf, buf_size, "/.__meta__");
     } else {
         size_t path_len = strlen(path);
-        if (path_len > 1 && path[path_len - 1] == '/') path_len--;
+        if (path_len > 1 && path[path_len - 1] == '/') path_len--; // Trim trailing slash if present
         snprintf(meta_key_buf, buf_size, "%.*s.__meta__", (int)path_len, path);
     }
 }
@@ -328,9 +334,9 @@ static json_t* get_metadata_json(const char *path) {
     json_t *root = NULL, *value_json = NULL, *inner_meta_json = NULL;
     json_error_t error;
 
-    struct fuse_context *context = fuse_get_context();
-    if (!context || !context->private_data) {
-        fprintf(stderr, "Error: get_metadata_json(%s): Invalid FUSE context!\n", path);
+    // Use global config here as FUSE context might not be ready during early init
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+        fprintf(stderr, "Error: get_metadata_json(%s): API config not initialized!\n", path);
         return NULL;
     }
 
@@ -386,100 +392,158 @@ static json_t* get_metadata_json(const char *path) {
              fprintf(stderr, "Warning: get_metadata_json: API GET failed for %s, HTTP: %ld\n", meta_key, http_code);
         }
         DEBUG_LOG("get_metadata_json: API GET failed or returned non-200 status (%ld). Returning NULL.\n", http_code);
-        return NULL; // Not found or other API error
+        return NULL;
     }
 }
 
-// Helper to POST metadata JSON object for a path.
-// Takes ownership of meta_json (will decref it).
+// Helper to post metadata JSON object for a path.
 // Returns 0 on success, or a negative FUSE error code on failure.
 static int post_metadata_json(const char *path, json_t *meta_json) {
-    DEBUG_LOG("post_metadata_json: Called for path: %s\n", path);
+    DEBUG_LOG("post_metadata_json: Entered for path: %s\n", path);
     char meta_key[1024];
-    char *meta_json_str = NULL;
-    char *request_body_str = NULL;
-    json_t *request_body_json = NULL;
+    char api_path[2048];
+    char *encoded_key = NULL;
+    char *inner_json_str = NULL;
+    char *outer_json_str = NULL;
     struct MemoryStruct response;
     long http_code;
     int ret = 0;
 
-    if (!meta_json || !json_is_object(meta_json)) {
-         fprintf(stderr, "Error: post_metadata_json: Invalid meta_json provided.\n");
-         if (meta_json) json_decref(meta_json);
-         return -EINVAL; 
+    // Use global config here as FUSE context might not be ready during early init
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+        fprintf(stderr, "Error: post_metadata_json(%s): API config not initialized!\n", path);
+        return -EIO;
     }
 
     get_meta_key(path, meta_key, sizeof(meta_key));
     DEBUG_LOG("post_metadata_json: Meta key: %s\n", meta_key);
-
-    // Add/update chunking info if it's a file metadata
-    if (json_object_get(meta_json, "mode") && S_ISREG(json_integer_value(json_object_get(meta_json, "mode")))) {
-        json_object_set_new(meta_json, "chunk_size", json_integer(HPKV_CHUNK_SIZE));
-        // num_chunks should be updated by write/truncate
-        if (!json_object_get(meta_json, "num_chunks")) {
-             json_object_set_new(meta_json, "num_chunks", json_integer(0)); // Default if missing
-        }
-    }
-
-    meta_json_str = json_dumps(meta_json, JSON_COMPACT | JSON_ENSURE_ASCII);
-    json_decref(meta_json); // Decref the original object
-    if (!meta_json_str) {
-        fprintf(stderr, "Error: post_metadata_json: Failed to dump inner metadata object to string for %s\n", meta_key);
+    encoded_key = url_encode(meta_key);
+    if (!encoded_key || encoded_key[0] == '\0') {
+        fprintf(stderr, "Error: post_metadata_json(%s): URL encoding failed for meta key.\n", path);
+        if (encoded_key) free(encoded_key);
         return -EIO;
     }
-    DEBUG_LOG("post_metadata_json: Inner metadata string: %s\n", meta_json_str);
+    snprintf(api_path, sizeof(api_path), "/record"); // POST to /record endpoint
 
-    request_body_json = json_object();
-    if (!request_body_json) { free(meta_json_str); return -ENOMEM; }
-    json_object_set_new(request_body_json, "key", json_string(meta_key));
-    json_object_set_new(request_body_json, "value", json_string(meta_json_str));
-    free(meta_json_str);
-
-    request_body_str = json_dumps(request_body_json, JSON_COMPACT | JSON_ENSURE_ASCII);
-    json_decref(request_body_json);
-    if (!request_body_str) {
-        fprintf(stderr, "Error: post_metadata_json: Failed to dump full request JSON for %s\n", meta_key);
+    // Dump the inner metadata object to a string
+    inner_json_str = json_dumps(meta_json, JSON_COMPACT);
+    if (!inner_json_str) {
+        fprintf(stderr, "Error: post_metadata_json(%s): Failed to dump inner metadata to JSON string.\n", path);
+        free(encoded_key);
         return -EIO;
     }
 
-    DEBUG_LOG("post_metadata_json: Performing POST request for %s\n", meta_key);
-    http_code = perform_hpkv_request_with_retry("POST", "/record", request_body_str, NULL, 0, &response, 3);
-    free(request_body_str);
+    // Create the outer JSON object: {"key": "<meta_key>", "value": "<inner_json_str>"}
+    json_t *outer_json = json_object();
+    if (!outer_json) {
+        fprintf(stderr, "Error: post_metadata_json(%s): Failed to create outer JSON object.\n", path);
+        free(inner_json_str);
+        free(encoded_key);
+        return -EIO;
+    }
+    json_object_set_new(outer_json, "key", json_string(meta_key));
+    json_object_set_new(outer_json, "value", json_string(inner_json_str));
+    free(inner_json_str); // Value string is now owned by outer_json
+
+    // Dump the outer JSON object to a string for the request body
+    outer_json_str = json_dumps(outer_json, JSON_COMPACT);
+    json_decref(outer_json);
+    if (!outer_json_str) {
+        fprintf(stderr, "Error: post_metadata_json(%s): Failed to dump outer JSON to string.\n", path);
+        free(encoded_key);
+        return -EIO;
+    }
+
+    DEBUG_LOG("post_metadata_json: Performing POST request for %s\n", api_path);
+    http_code = perform_hpkv_request_with_retry("POST", api_path, outer_json_str, NULL, 0, &response, 3);
+    free(outer_json_str);
+    free(encoded_key);
+
+    if (http_code >= 200 && http_code < 300) {
+        DEBUG_LOG("post_metadata_json(%s): Successfully posted metadata.\n", path);
+        ret = 0;
+    } else {
+        fprintf(stderr, "Error: post_metadata_json(%s): API POST failed, HTTP: %ld\n", path, http_code);
+        ret = map_http_to_fuse_error(http_code);
+    }
+
     if (response.memory) {
-         free(response.memory);
-         response.memory = NULL;
+        free(response.memory); // Free response memory if any
     }
-
-    ret = map_http_to_fuse_error(http_code);
-    if (ret != 0) {
-        fprintf(stderr, "Warning: post_metadata_json: Failed POST for %s, HTTP: %ld, FUSE: %d\n", meta_key, http_code, ret);
-    }
-    DEBUG_LOG("post_metadata_json: Finished for %s, returning %d\n", path, ret);
     return ret;
 }
 
-// Helper to GET a specific chunk of a file.
-// Returns a malloc'd buffer with the chunk content (caller must free), or NULL on error/not found.
-// Populates chunk_len with the length of the retrieved chunk data.
-static char* get_chunk_content(const char *base_path, int chunk_index, size_t *chunk_len) {
-    DEBUG_LOG("get_chunk_content: Called for path: %s, chunk: %d\n", base_path, chunk_index);
+// Helper to delete a key (metadata or chunk)
+// Returns 0 on success or 404, negative FUSE error code otherwise.
+static int delete_hpkv_key(const char *key) {
+    DEBUG_LOG("delete_hpkv_key: Entered for key: %s\n", key);
+    char api_path[2048];
+    char *encoded_key = NULL;
+    struct MemoryStruct response;
+    long http_code;
+    int ret = 0;
+
+    // Use global config here as FUSE context might not be ready during early init
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+        fprintf(stderr, "Error: delete_hpkv_key(%s): API config not initialized!\n", key);
+        return -EIO;
+    }
+
+    encoded_key = url_encode(key);
+    if (!encoded_key || encoded_key[0] == '\0') {
+        fprintf(stderr, "Error: delete_hpkv_key(%s): URL encoding failed.\n", key);
+        if (encoded_key) free(encoded_key);
+        return -EIO;
+    }
+    snprintf(api_path, sizeof(api_path), "/record/%s", encoded_key);
+    free(encoded_key);
+
+    DEBUG_LOG("delete_hpkv_key: Performing DELETE request for %s\n", api_path);
+    http_code = perform_hpkv_request_with_retry("DELETE", api_path, NULL, NULL, 0, &response, 3);
+
+    if (http_code == 204 || http_code == 404) { // Success or Not Found are okay for delete
+        DEBUG_LOG("delete_hpkv_key(%s): DELETE successful or key not found (HTTP: %ld).\n", key, http_code);
+        ret = 0;
+    } else {
+        fprintf(stderr, "Error: delete_hpkv_key(%s): API DELETE failed, HTTP: %ld\n", key, http_code);
+        ret = map_http_to_fuse_error(http_code);
+    }
+
+    if (response.memory) {
+        free(response.memory); // Free response memory if any
+    }
+    return ret;
+}
+
+// Helper to get chunk content.
+// Returns a MemoryStruct with content (caller must free memory) or NULL memory on error/not found.
+static struct MemoryStruct get_chunk_content(const char *base_path, int chunk_index) {
+    DEBUG_LOG("get_chunk_content: Entered for path: %s, chunk: %d\n", base_path, chunk_index);
     char chunk_key[1024];
     char api_path[2048];
     char *encoded_key = NULL;
     struct MemoryStruct response;
     long http_code;
-    json_t *root = NULL, *value_json = NULL;
+    json_t *root = NULL;
     json_error_t error;
-    char *chunk_data = NULL;
 
-    *chunk_len = 0;
+    // Initialize response to safe state
+    response.memory = NULL;
+    response.size = 0;
+
+    // Use global config here as FUSE context might not be ready during early init
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+        fprintf(stderr, "Error: get_chunk_content(%s, %d): API config not initialized!\n", base_path, chunk_index);
+        return response;
+    }
+
     get_chunk_key(base_path, chunk_index, chunk_key, sizeof(chunk_key));
     DEBUG_LOG("get_chunk_content: Chunk key: %s\n", chunk_key);
     encoded_key = url_encode(chunk_key);
     if (!encoded_key || encoded_key[0] == '\0') {
         fprintf(stderr, "Error: get_chunk_content(%s, %d): URL encoding failed for chunk key.\n", base_path, chunk_index);
         if (encoded_key) free(encoded_key);
-        return NULL;
+        return response;
     }
     snprintf(api_path, sizeof(api_path), "/record/%s", encoded_key);
     free(encoded_key);
@@ -489,141 +553,178 @@ static char* get_chunk_content(const char *base_path, int chunk_index, size_t *c
 
     if (http_code == 200 && response.memory) {
         root = json_loads(response.memory, 0, &error);
-        free(response.memory); response.memory = NULL;
+        free(response.memory); response.memory = NULL; // Reset response struct
+        response.size = 0;
         if (!root) {
-            fprintf(stderr, "Error: get_chunk_content(%s, %d): Failed to parse JSON response: %s\n", base_path, chunk_index, error.text);
-            return NULL;
+            fprintf(stderr, "Error: get_chunk_content(%s, %d): Failed to parse outer JSON response: %s\n", base_path, chunk_index, error.text);
+            return response;
         }
-        value_json = json_object_get(root, "value");
+        json_t *value_json = json_object_get(root, "value");
         if (!json_is_string(value_json)) {
-            fprintf(stderr, "Error: get_chunk_content(%s, %d): API response 'value' is not a string.\n", base_path, chunk_index);
+            fprintf(stderr, "Error: get_chunk_content(%s, %d): API response missing 'value' string.\n", base_path, chunk_index);
             json_decref(root);
-            return NULL;
+            return response;
         }
-        // Use json_string_length for binary safety
-        *chunk_len = json_string_length(value_json);
-        chunk_data = malloc(*chunk_len + 1); // +1 for potential null terminator
-        if (!chunk_data) {
-            fprintf(stderr, "Error: get_chunk_content(%s, %d): Failed to allocate memory for chunk data (%zu bytes).\n", base_path, chunk_index, *chunk_len);
-            json_decref(root);
-            return NULL;
+        // We need the raw string content, potentially binary.
+        // Jansson stores strings with null termination, but size might be needed.
+        // Let's duplicate the string and get its length from Jansson.
+        const char *value_str = json_string_value(value_json);
+        size_t value_len = json_string_length(value_json);
+        
+        response.memory = malloc(value_len + 1); // +1 for safety, though Jansson might include it
+        if (!response.memory) {
+             fprintf(stderr, "Error: get_chunk_content(%s, %d): Failed to allocate memory for chunk content.\n", base_path, chunk_index);
+             json_decref(root);
+             return response;
         }
-        memcpy(chunk_data, json_string_value(value_json), *chunk_len);
-        chunk_data[*chunk_len] = '\0'; // Null-terminate
+        memcpy(response.memory, value_str, value_len);
+        response.memory[value_len] = '\0'; // Ensure null termination
+        response.size = value_len;
+
         json_decref(root);
-        DEBUG_LOG("get_chunk_content(%s, %d): Successfully retrieved chunk, length %zu.\n", base_path, chunk_index, *chunk_len);
-        return chunk_data;
+        DEBUG_LOG("get_chunk_content(%s, %d): Successfully retrieved chunk content (size %zu).\n", base_path, chunk_index, response.size);
+        return response; // Return the actual chunk content
     } else {
         if (response.memory) {
              free(response.memory);
              response.memory = NULL;
         }
         if (http_code != 404) {
-            fprintf(stderr, "Warning: get_chunk_content: API GET failed for %s, HTTP: %ld\n", chunk_key, http_code);
+             fprintf(stderr, "Warning: get_chunk_content: API GET failed for %s, HTTP: %ld\n", chunk_key, http_code);
         }
-        DEBUG_LOG("get_chunk_content: Chunk %d not found or API error (%ld). Returning NULL.\n", chunk_index, http_code);
-        return NULL; // Not found or other API error
+        DEBUG_LOG("get_chunk_content: API GET failed or returned non-200 status (%ld). Returning empty response.\n", http_code);
+        return response; // Return empty response on error/not found
     }
 }
 
-// Helper to POST a specific chunk of a file.
+// Helper to post chunk content.
 // Returns 0 on success, or a negative FUSE error code on failure.
-static int post_chunk_content(const char *base_path, int chunk_index, const char *chunk_data, size_t chunk_len) {
-    DEBUG_LOG("post_chunk_content: Called for path: %s, chunk: %d, len: %zu\n", base_path, chunk_index, chunk_len);
+static int post_chunk_content(const char *base_path, int chunk_index, const char *content, size_t content_len) {
+    DEBUG_LOG("post_chunk_content: Entered for path: %s, chunk: %d, len: %zu\n", base_path, chunk_index, content_len);
     char chunk_key[1024];
-    char *request_body_str = NULL;
-    json_t *request_body_json = NULL;
+    char api_path[2048];
+    char *encoded_key = NULL;
+    char *outer_json_str = NULL;
     struct MemoryStruct response;
     long http_code;
     int ret = 0;
 
-    if (chunk_len > HPKV_CHUNK_SIZE) {
-        fprintf(stderr, "Error: post_chunk_content(%s, %d): Attempted to write chunk larger than limit (%zu > %d)\n", 
-                base_path, chunk_index, chunk_len, HPKV_CHUNK_SIZE);
-        return -EINVAL;
+    // Use global config here as FUSE context might not be ready during early init
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+        fprintf(stderr, "Error: post_chunk_content(%s, %d): API config not initialized!\n", base_path, chunk_index);
+        return -EIO;
     }
 
     get_chunk_key(base_path, chunk_index, chunk_key, sizeof(chunk_key));
     DEBUG_LOG("post_chunk_content: Chunk key: %s\n", chunk_key);
-
-    request_body_json = json_object();
-    if (!request_body_json) return -ENOMEM;
-    json_object_set_new(request_body_json, "key", json_string(chunk_key));
-    // Use json_stringn for binary safety
-    json_object_set_new(request_body_json, "value", json_stringn(chunk_data, chunk_len));
-
-    // Dump using json_dumps (handles escaping correctly)
-    request_body_str = json_dumps(request_body_json, JSON_COMPACT | JSON_ENSURE_ASCII);
-    json_decref(request_body_json);
-    if (!request_body_str) {
-        fprintf(stderr, "Error: post_chunk_content(%s, %d): Failed to dump request JSON.\n", base_path, chunk_index);
-        return -EIO;
-    }
-
-    DEBUG_LOG("post_chunk_content: Performing POST request for %s\n", chunk_key);
-    // Use the version of perform_hpkv_request_with_retry that takes length
-    http_code = perform_hpkv_request_with_retry("POST", "/record", NULL, request_body_str, strlen(request_body_str), &response, 3);
-    free(request_body_str);
-    if (response.memory) {
-         free(response.memory);
-         response.memory = NULL;
-    }
-
-    ret = map_http_to_fuse_error(http_code);
-    if (ret != 0) {
-        fprintf(stderr, "Warning: post_chunk_content: Failed POST for %s, HTTP: %ld, FUSE: %d\n", chunk_key, http_code, ret);
-    }
-    DEBUG_LOG("post_chunk_content: Finished for %s, chunk %d, returning %d\n", base_path, chunk_index, ret);
-    return ret;
-}
-
-// Helper to DELETE a specific chunk of a file.
-// Returns 0 on success or ENOENT, negative FUSE error code otherwise.
-static int delete_chunk_content(const char *base_path, int chunk_index) {
-    DEBUG_LOG("delete_chunk_content: Called for path: %s, chunk: %d\n", base_path, chunk_index);
-    char chunk_key[1024];
-    char api_path[2048];
-    char *encoded_key = NULL;
-    struct MemoryStruct response;
-    long http_code;
-    int ret = 0;
-
-    get_chunk_key(base_path, chunk_index, chunk_key, sizeof(chunk_key));
-    DEBUG_LOG("delete_chunk_content: Chunk key: %s\n", chunk_key);
     encoded_key = url_encode(chunk_key);
     if (!encoded_key || encoded_key[0] == '\0') {
-        fprintf(stderr, "Error: delete_chunk_content(%s, %d): URL encoding failed.\n", base_path, chunk_index);
+        fprintf(stderr, "Error: post_chunk_content(%s, %d): URL encoding failed for chunk key.\n", base_path, chunk_index);
         if (encoded_key) free(encoded_key);
         return -EIO;
     }
-    snprintf(api_path, sizeof(api_path), "/record/%s", encoded_key);
+    snprintf(api_path, sizeof(api_path), "/record"); // POST to /record endpoint
+
+    // Create the outer JSON object: {"key": "<chunk_key>", "value": "<content_string>"}
+    json_t *outer_json = json_object();
+    if (!outer_json) {
+        fprintf(stderr, "Error: post_chunk_content(%s, %d): Failed to create outer JSON object.\n", base_path, chunk_index);
+        free(encoded_key);
+        return -EIO;
+    }
+    json_object_set_new(outer_json, "key", json_string(chunk_key));
+    // Use json_stringn for potentially binary data
+    json_object_set_new(outer_json, "value", json_stringn(content, content_len)); 
+
+    // Dump the outer JSON object to a string for the request body
+    outer_json_str = json_dumps(outer_json, JSON_COMPACT | JSON_ENSURE_ASCII); // Ensure ASCII for safety?
+    json_decref(outer_json);
+    if (!outer_json_str) {
+        fprintf(stderr, "Error: post_chunk_content(%s, %d): Failed to dump outer JSON to string.\n", base_path, chunk_index);
+        free(encoded_key);
+        return -EIO;
+    }
+
+    DEBUG_LOG("post_chunk_content: Performing POST request for %s\n", api_path);
+    // Use the outer_json_str as the request body
+    http_code = perform_hpkv_request_with_retry("POST", api_path, outer_json_str, NULL, 0, &response, 3);
+    free(outer_json_str);
     free(encoded_key);
 
-    DEBUG_LOG("delete_chunk_content: Performing DELETE request for %s\n", api_path);
-    http_code = perform_hpkv_request_with_retry("DELETE", api_path, NULL, NULL, 0, &response, 3);
-    if (response.memory) {
-         free(response.memory);
-         response.memory = NULL;
+    if (http_code >= 200 && http_code < 300) {
+        DEBUG_LOG("post_chunk_content(%s, %d): Successfully posted chunk content.\n", base_path, chunk_index);
+        ret = 0;
+    } else {
+        fprintf(stderr, "Error: post_chunk_content(%s, %d): API POST failed, HTTP: %ld\n", base_path, chunk_index, http_code);
+        ret = map_http_to_fuse_error(http_code);
     }
 
-    ret = map_http_to_fuse_error(http_code);
-    if (ret != 0 && ret != -ENOENT) {
-        fprintf(stderr, "Warning: delete_chunk_content: Failed DELETE for %s, HTTP: %ld, FUSE: %d\n", chunk_key, http_code, ret);
-    } else if (ret == -ENOENT) {
-        DEBUG_LOG("delete_chunk_content: Chunk %s not found (ENOENT), considered success.\n", chunk_key);
-        ret = 0; // Treat not found as success for deletion
+    if (response.memory) {
+        free(response.memory); // Free response memory if any
     }
-    DEBUG_LOG("delete_chunk_content: Finished for %s, chunk %d, returning %d\n", base_path, chunk_index, ret);
     return ret;
 }
 
+// --- Automatic Root Initialization ---
 
-// --- FUSE Operations (Modified for Chunking) ---
+// Creates default metadata for the root directory
+static int create_default_root_metadata() {
+    DEBUG_LOG("create_default_root_metadata: Attempting to create default root metadata.\n");
+    json_t *meta_json = json_object();
+    if (!meta_json) {
+        fprintf(stderr, "Error: create_default_root_metadata: Failed to create JSON object.\n");
+        return -ENOMEM;
+    }
 
-// getattr: Get file attributes (mostly unchanged, reads size from metadata)
+    time_t now = time(NULL);
+    uid_t uid = getuid(); // Use current user's UID
+    gid_t gid = getgid(); // Use current user's GID
+
+    json_object_set_new(meta_json, "mode", json_integer(S_IFDIR | 0755));
+    json_object_set_new(meta_json, "uid", json_integer(uid));
+    json_object_set_new(meta_json, "gid", json_integer(gid));
+    json_object_set_new(meta_json, "size", json_integer(0)); // Directories have 0 size
+    json_object_set_new(meta_json, "atime", json_integer(now));
+    json_object_set_new(meta_json, "mtime", json_integer(now));
+    json_object_set_new(meta_json, "ctime", json_integer(now));
+    json_object_set_new(meta_json, "num_chunks", json_integer(0)); // No chunks for directory
+    json_object_set_new(meta_json, "chunk_size", json_integer(HPKV_CHUNK_SIZE));
+
+    int ret = post_metadata_json("/", meta_json);
+    json_decref(meta_json);
+
+    if (ret == 0) {
+        DEBUG_LOG("create_default_root_metadata: Successfully created default root metadata.\n");
+    } else {
+        fprintf(stderr, "Error: create_default_root_metadata: Failed to post default root metadata (Error %d).\n", ret);
+    }
+    return ret;
+}
+
+// Checks if root metadata exists and creates it if not.
+// Returns 0 on success (exists or created), negative error code on failure.
+static int ensure_root_metadata_exists() {
+    DEBUG_LOG("ensure_root_metadata_exists: Checking for root metadata...\n");
+    json_t *meta_json = get_metadata_json("/");
+    if (meta_json) {
+        DEBUG_LOG("ensure_root_metadata_exists: Root metadata found.\n");
+        json_decref(meta_json);
+        return 0; // Root exists
+    } else {
+        // Check if the error was specifically ENOENT (404)
+        // Note: get_metadata_json returns NULL for various errors, not just 404.
+        // We rely on the fact that if it's NULL, we should try creating it.
+        DEBUG_LOG("ensure_root_metadata_exists: Root metadata not found or error retrieving. Attempting creation...\n");
+        return create_default_root_metadata();
+    }
+}
+
+// --- FUSE Operations Implementation ---
+
 static int hpkv_getattr(const char *path, struct stat *stbuf) {
     DEBUG_LOG("hpkv_getattr: Entered for path: %s\n", path);
-    json_t *meta_json = NULL, *j_val;
+    memset(stbuf, 0, sizeof(struct stat));
+    json_t *meta_json = NULL;
     int ret = 0;
 
     struct fuse_context *context = fuse_get_context();
@@ -632,124 +733,77 @@ static int hpkv_getattr(const char *path, struct stat *stbuf) {
         return -EIO;
     }
 
-    memset(stbuf, 0, sizeof(struct stat));
     meta_json = get_metadata_json(path);
-
-    if (meta_json) {
-        DEBUG_LOG("hpkv_getattr(%s): get_metadata_json returned successfully. Populating stat buffer.\n", path);
-        stbuf->st_mode = S_IFREG | 0644; 
-        stbuf->st_nlink = 1;
-        stbuf->st_size = 0;
-        #ifdef _WIN32
-            stbuf->st_uid = 0; stbuf->st_gid = 0;
-        #else
-            stbuf->st_uid = context->uid; stbuf->st_gid = context->gid;
-        #endif
-        time_t now = time(NULL);
-        stbuf->st_atime = now; stbuf->st_mtime = now; stbuf->st_ctime = now;
-
-        j_val = json_object_get(meta_json, "mode");
-        if (json_is_integer(j_val)) stbuf->st_mode = (mode_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "size"); // Total logical size
-        if (json_is_integer(j_val)) stbuf->st_size = (off_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "uid");
-        if (json_is_integer(j_val)) stbuf->st_uid = (uid_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "gid");
-        if (json_is_integer(j_val)) stbuf->st_gid = (gid_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "atime");
-        if (json_is_integer(j_val)) stbuf->st_atime = (time_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "mtime");
-        if (json_is_integer(j_val)) stbuf->st_mtime = (time_t)json_integer_value(j_val);
-        j_val = json_object_get(meta_json, "ctime");
-        if (json_is_integer(j_val)) stbuf->st_ctime = (time_t)json_integer_value(j_val);
-
-        if (S_ISDIR(stbuf->st_mode)) {
-            stbuf->st_nlink = 2; 
-        }
-
-        json_decref(meta_json);
-        ret = 0; // Success
-        DEBUG_LOG("hpkv_getattr(%s): Successfully populated stat buffer. Mode: %o, Size: %ld\n", path, stbuf->st_mode, stbuf->st_size);
-    } else {
-        DEBUG_LOG("hpkv_getattr(%s): get_metadata_json returned NULL. Returning -ENOENT.\n", path);
-        ret = -ENOENT; // Not found
+    if (!meta_json) {
+        DEBUG_LOG("hpkv_getattr(%s): Metadata not found or error retrieving. Returning ENOENT.\n", path);
+        return -ENOENT;
     }
 
-    DEBUG_LOG("hpkv_getattr: Finished for path: %s, returning %d\n", path, ret);
+    // Populate stat buffer from JSON
+    stbuf->st_mode = (mode_t)json_integer_value(json_object_get(meta_json, "mode"));
+    stbuf->st_uid = (uid_t)json_integer_value(json_object_get(meta_json, "uid"));
+    stbuf->st_gid = (gid_t)json_integer_value(json_object_get(meta_json, "gid"));
+    stbuf->st_size = (off_t)json_integer_value(json_object_get(meta_json, "size"));
+    stbuf->st_atime = (time_t)json_integer_value(json_object_get(meta_json, "atime"));
+    stbuf->st_mtime = (time_t)json_integer_value(json_object_get(meta_json, "mtime"));
+    stbuf->st_ctime = (time_t)json_integer_value(json_object_get(meta_json, "ctime"));
+
+    // Set nlink based on type (simplified)
+    if (S_ISDIR(stbuf->st_mode)) {
+        stbuf->st_nlink = 2; // Directories typically have at least 2 links (. and ..)
+    } else {
+        stbuf->st_nlink = 1;
+    }
+
+    // Set block size (optional, can affect performance reporting)
+    stbuf->st_blksize = 4096;
+    stbuf->st_blocks = (stbuf->st_size + 511) / 512; // Number of 512B blocks
+
+    DEBUG_LOG("hpkv_getattr(%s): Success. Mode=%o, Size=%ld\n", path, stbuf->st_mode, stbuf->st_size);
+    json_decref(meta_json);
     return ret;
 }
 
-// readdir: Read directory contents (Modified to filter chunk keys and skip empty root entry)
 static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
-    DEBUG_LOG("hpkv_readdir: Called for path: %s, offset: %ld\n", path, offset);
-    (void) offset; (void) fi;
-
-    char start_key_buf[1024];
-    char end_key_buf[1024];
+    (void) offset; // Unused parameter
+    (void) fi;     // Unused parameter
+    DEBUG_LOG("hpkv_readdir: Entered for path: %s\n", path);
     char api_path[2048];
-    char *encoded_start = NULL;
-    char *encoded_end = NULL;
+    char *encoded_prefix = NULL;
     struct MemoryStruct response;
     long http_code;
-    json_t *root = NULL, *records = NULL, *record = NULL;
+    json_t *root = NULL, *keys_array = NULL;
     json_error_t error;
     int ret = 0;
-    size_t i;
 
-    // Use a simple buffer to track added entries to avoid duplicates
-    #define MAX_DIR_ENTRIES 512
-    char added_entries[MAX_DIR_ENTRIES][256];
-    int added_count = 0;
-
-    // Function to check if entry was already added
-    int already_added(const char *name) {
-        for (int j = 0; j < added_count; ++j) {
-            if (strcmp(added_entries[j], name) == 0) return 1;
-        }
-        return 0;
-    }
-
-    // Function to add entry if not already present and not empty
-    void add_entry(const char *name) {
-        if (name && name[0] != '\0' && !already_added(name) && added_count < MAX_DIR_ENTRIES) {
-            strncpy(added_entries[added_count], name, 255);
-            added_entries[added_count][255] = '\0'; // Ensure null termination
-            filler(buf, name, NULL, 0);
-            added_count++;
-        }
-    }
-
-    DEBUG_LOG("hpkv_readdir(%s): Adding '.' and '..'\n", path);
-    add_entry(".");
-    add_entry("..");
-
-    if (strcmp(path, "/") == 0) {
-        snprintf(start_key_buf, sizeof(start_key_buf), "/");
-    } else {
-        snprintf(start_key_buf, sizeof(start_key_buf), "%s/", path);
-    }
-    // Safely construct end_key_buf
-    size_t start_len = strlen(start_key_buf);
-    if (start_len + 1 >= sizeof(end_key_buf)) { // Check if space for \xFF and null terminator
-        fprintf(stderr, "Error: hpkv_readdir(%s): start_key_buf too long to append suffix.\n", path);
-        return -ENAMETOOLONG;
-    }
-    memcpy(end_key_buf, start_key_buf, start_len);
-    end_key_buf[start_len] = '\xFF';
-    end_key_buf[start_len + 1] = '\0';
-
-    encoded_start = url_encode(start_key_buf);
-    encoded_end = url_encode(end_key_buf);
-    if (!encoded_start || !encoded_end || encoded_start[0] == '\0' || encoded_end[0] == '\0') {
-        fprintf(stderr, "Error: hpkv_readdir(%s): Failed to URL encode start/end keys.\n", path);
-        if (encoded_start) free(encoded_start);
-        if (encoded_end) free(encoded_end);
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_readdir(%s): Invalid FUSE context!\n", path);
         return -EIO;
     }
-    snprintf(api_path, sizeof(api_path), "/records?startKey=%s&endKey=%s", encoded_start, encoded_end);
-    free(encoded_start); free(encoded_end);
 
-    DEBUG_LOG("hpkv_readdir(%s): Performing GET request for range: %s\n", path, api_path);
+    // Add '.' and '..'
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    // Construct prefix for listing keys
+    char prefix[1024];
+    if (strcmp(path, "/") == 0) {
+        snprintf(prefix, sizeof(prefix), "/"); // List keys starting with /
+    } else {
+        snprintf(prefix, sizeof(prefix), "%s/", path); // List keys starting with /dir/
+    }
+    DEBUG_LOG("hpkv_readdir: Listing prefix: %s\n", prefix);
+    encoded_prefix = url_encode(prefix);
+    if (!encoded_prefix || encoded_prefix[0] == '\0') {
+        fprintf(stderr, "Error: hpkv_readdir(%s): URL encoding failed for prefix.\n", path);
+        if (encoded_prefix) free(encoded_prefix);
+        return -EIO;
+    }
+    snprintf(api_path, sizeof(api_path), "/keys?prefix=%s", encoded_prefix);
+    free(encoded_prefix);
+
+    DEBUG_LOG("hpkv_readdir: Performing GET request for %s\n", api_path);
     http_code = perform_hpkv_request_with_retry("GET", api_path, NULL, NULL, 0, &response, 3);
 
     if (http_code == 200 && response.memory) {
@@ -759,72 +813,86 @@ static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
             fprintf(stderr, "Error: hpkv_readdir(%s): Failed to parse JSON response: %s\n", path, error.text);
             return -EIO;
         }
-        records = json_object_get(root, "records");
-        if (!json_is_array(records)) {
-            fprintf(stderr, "Error: hpkv_readdir(%s): JSON response missing 'records' array.\n", path);
+        keys_array = json_object_get(root, "keys");
+        if (!json_is_array(keys_array)) {
+            fprintf(stderr, "Error: hpkv_readdir(%s): API response missing 'keys' array.\n", path);
             json_decref(root);
             return -EIO;
         }
-        DEBUG_LOG("hpkv_readdir(%s): Found %zu records in response.\n", path, json_array_size(records));
 
-        for (i = 0; i < json_array_size(records); i++) {
-            record = json_array_get(records, i);
-            if (!json_is_object(record)) continue;
-            json_t *key_json = json_object_get(record, "key");
-            if (!json_is_string(key_json)) continue;
+        size_t index;
+        json_t *value;
+        size_t prefix_len = strlen(prefix);
 
-            const char *full_key = json_string_value(key_json);
-            DEBUG_LOG("hpkv_readdir(%s): Processing key: %s\n", path, full_key);
+        json_array_foreach(keys_array, index, value) {
+            if (!json_is_string(value)) continue;
+            const char *key = json_string_value(value);
+            DEBUG_LOG("hpkv_readdir: Processing key: %s\n", key);
 
-            const char *entry_name_ptr = full_key + strlen(start_key_buf);
-            if (*entry_name_ptr == '\0') continue; // Skip the directory key itself
+            // Check if the key starts with the directory prefix
+            if (strncmp(key, prefix, prefix_len) != 0) continue;
 
+            // Extract the entry name relative to the current directory
+            const char *entry_name_ptr = key + prefix_len;
+            if (*entry_name_ptr == '\0') continue; // Skip the directory itself if listed
+
+            // Find the next slash, if any
             const char *next_slash = strchr(entry_name_ptr, '/');
-            char current_entry[256];
 
-            if (next_slash) {
-                // Key is inside a subdirectory. Extract the subdir name.
-                size_t subdir_len = next_slash - entry_name_ptr;
-                if (subdir_len < sizeof(current_entry)) {
-                    strncpy(current_entry, entry_name_ptr, subdir_len);
-                    current_entry[subdir_len] = '\0';
-                    DEBUG_LOG("hpkv_readdir(%s): Adding potential directory entry: %s\n", path, current_entry);
-                    add_entry(current_entry); // Add the directory name
+            // Check if it's a metadata key
+            if (strstr(entry_name_ptr, ".__meta__") == (entry_name_ptr + strlen(entry_name_ptr) - 9)) {
+                // It's a metadata key, extract the base name
+                char base_name[512];
+                size_t base_len = strlen(entry_name_ptr) - 9;
+                if (base_len >= sizeof(base_name)) base_len = sizeof(base_name) - 1;
+                strncpy(base_name, entry_name_ptr, base_len);
+                base_name[base_len] = '\0';
+
+                // Check if it represents a direct child (no slashes in base_name)
+                if (strchr(base_name, '/') == NULL) {
+                    // Skip adding empty entry for root metadata
+                    if (strlen(base_name) > 0) {
+                        DEBUG_LOG("hpkv_readdir: Adding entry: %s\n", base_name);
+                        filler(buf, base_name, NULL, 0);
+                    } else {
+                        DEBUG_LOG("hpkv_readdir: Skipping empty entry name derived from root metadata.\n");
+                    }
                 } else {
-                    fprintf(stderr, "Warning: hpkv_readdir(%s): Subdirectory name too long: %.*s...\n", path, (int)sizeof(current_entry)-1, entry_name_ptr);
-                }
-            } else {
-                // Key is a direct child. Check if it's metadata or chunk.
-                if (strstr(entry_name_ptr, ".__meta__") == (entry_name_ptr + strlen(entry_name_ptr) - 9)) {
-                    // It's a metadata key. Extract the base name.
-                    size_t base_len = strlen(entry_name_ptr) - 9;
-                    if (base_len < sizeof(current_entry)) {
-                        strncpy(current_entry, entry_name_ptr, base_len);
-                        current_entry[base_len] = '\0';
-                        // *** FIX: Check if the extracted name is empty before adding ***
-                        if (current_entry[0] != '\0') {
-                            DEBUG_LOG("hpkv_readdir(%s): Adding entry from metadata: %s\n", path, current_entry);
-                            add_entry(current_entry); // Add the file/dir name
-                        } else {
-                            DEBUG_LOG("hpkv_readdir(%s): Skipping empty entry derived from metadata key: %s\n", path, full_key);
+                    // It's metadata for something deeper, extract the top-level dir name
+                    const char *first_slash = strchr(base_name, '/');
+                    if (first_slash) {
+                        char top_dir[512];
+                        size_t top_dir_len = first_slash - base_name;
+                        if (top_dir_len < sizeof(top_dir)) {
+                            strncpy(top_dir, base_name, top_dir_len);
+                            top_dir[top_dir_len] = '\0';
+                            // Check if this top-level dir was already added (simple check)
+                            // A more robust solution might use a hash set
+                            // For now, we might add duplicates if multiple items exist in a subdir
+                            DEBUG_LOG("hpkv_readdir: Adding potential subdirectory entry: %s\n", top_dir);
+                            filler(buf, top_dir, NULL, 0); // Add the directory name
                         }
-                    } else {
-                         fprintf(stderr, "Warning: hpkv_readdir(%s): Base name too long from metadata: %.*s...\n", path, (int)sizeof(current_entry)-1, entry_name_ptr);
                     }
-                } else if (strstr(entry_name_ptr, ".chunk") == NULL) {
-                    // It's not metadata and not a chunk key, assume it's a direct file/object name
-                    // (This case might occur if files < CHUNK_SIZE are stored directly? Current logic doesn't do this)
-                    if (strlen(entry_name_ptr) < sizeof(current_entry)) {
-                        strcpy(current_entry, entry_name_ptr);
-                        DEBUG_LOG("hpkv_readdir(%s): Adding direct entry (non-meta, non-chunk): %s\n", path, current_entry);
-                        add_entry(current_entry);
-                    } else {
-                         fprintf(stderr, "Warning: hpkv_readdir(%s): Direct entry name too long: %.*s...\n", path, (int)sizeof(current_entry)-1, entry_name_ptr);
-                    }
-                } else {
-                    // It's a chunk key, ignore it for readdir listing.
-                    DEBUG_LOG("hpkv_readdir(%s): Ignoring chunk key: %s\n", path, full_key);
                 }
+            } else if (strstr(entry_name_ptr, ".chunk") != NULL) {
+                // It's a chunk key, ignore it directly in readdir
+                DEBUG_LOG("hpkv_readdir: Skipping chunk key: %s\n", key);
+                continue;
+            } else if (next_slash) {
+                 // It's a key for something inside a subdirectory, extract the subdir name
+                 char subdir_name[512];
+                 size_t subdir_len = next_slash - entry_name_ptr;
+                 if (subdir_len < sizeof(subdir_name)) {
+                     strncpy(subdir_name, entry_name_ptr, subdir_len);
+                     subdir_name[subdir_len] = '\0';
+                     // Add the subdirectory name (might add duplicates)
+                     DEBUG_LOG("hpkv_readdir: Adding potential subdirectory entry from nested key: %s\n", subdir_name);
+                     filler(buf, subdir_name, NULL, 0);
+                 }
+            } else {
+                // It's likely a key for a file/object without metadata or chunks yet?
+                // Or maybe an old key format. For now, let's ignore these unexpected keys.
+                DEBUG_LOG("hpkv_readdir: Skipping unexpected key format: %s\n", key);
             }
         }
         json_decref(root);
@@ -833,884 +901,923 @@ static int hpkv_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
              free(response.memory);
              response.memory = NULL;
         }
-        fprintf(stderr, "Warning: hpkv_readdir(%s): API GET failed for range, HTTP: %ld\n", path, http_code);
-        ret = map_http_to_fuse_error(http_code);
-    }
-
-    DEBUG_LOG("hpkv_readdir: Finished for path: %s, returning %d\n", path, ret);
-    return ret;
-}
-
-
-// mkdir: Create a directory (unchanged)
-static int hpkv_mkdir(const char *path, mode_t mode) {
-    DEBUG_LOG("hpkv_mkdir: Called for path: %s, mode: %o\n", path, mode);
-    json_t *meta_json = NULL;
-    int ret = 0;
-    struct fuse_context *context = fuse_get_context();
-
-    meta_json = json_object();
-    if (!meta_json) return -ENOMEM;
-
-    json_object_set_new(meta_json, "mode", json_integer(S_IFDIR | (mode & 0777)));
-    json_object_set_new(meta_json, "uid", json_integer(context ? context->uid : getuid()));
-    json_object_set_new(meta_json, "gid", json_integer(context ? context->gid : getgid()));
-    json_object_set_new(meta_json, "size", json_integer(0));
-    time_t now = time(NULL);
-    json_object_set_new(meta_json, "atime", json_integer(now));
-    json_object_set_new(meta_json, "mtime", json_integer(now));
-    json_object_set_new(meta_json, "ctime", json_integer(now));
-
-    ret = post_metadata_json(path, meta_json);
-    DEBUG_LOG("hpkv_mkdir: Finished for path: %s, returning %d\n", path, ret);
-    return ret;
-}
-
-// rmdir: Remove a directory (unchanged, still lacks emptiness check)
-static int hpkv_rmdir(const char *path) {
-    DEBUG_LOG("hpkv_rmdir: Called for path: %s\n", path);
-    char meta_key[1024];
-    char api_path[2048];
-    char *encoded_key = NULL;
-    struct MemoryStruct response;
-    long http_code;
-    int ret = 0;
-
-    // TODO: Add check if directory is empty using readdir logic.
-
-    get_meta_key(path, meta_key, sizeof(meta_key));
-    encoded_key = url_encode(meta_key);
-    if (!encoded_key || encoded_key[0] == '\0') {
-        fprintf(stderr, "Error: hpkv_rmdir(%s): Failed to URL encode meta key.\n", path);
-        if (encoded_key) free(encoded_key);
-        return -EIO;
-    }
-    snprintf(api_path, sizeof(api_path), "/record/%s", encoded_key);
-    free(encoded_key);
-
-    http_code = perform_hpkv_request_with_retry("DELETE", api_path, NULL, NULL, 0, &response, 3);
-    if (response.memory) {
-         free(response.memory);
-         response.memory = NULL;
-    }
-    ret = map_http_to_fuse_error(http_code);
-
-    DEBUG_LOG("hpkv_rmdir: Finished for path: %s, returning %d\n", path, ret);
-    return ret;
-}
-
-// create: Create a new file (Modified for chunking metadata)
-static int hpkv_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
-    DEBUG_LOG("hpkv_create: Called for path: %s, mode: %o\n", path, mode);
-    (void) fi;
-    json_t *meta_json = NULL;
-    int ret = 0;
-    struct fuse_context *context = fuse_get_context();
-
-    meta_json = json_object();
-    if (!meta_json) return -ENOMEM;
-
-    json_object_set_new(meta_json, "mode", json_integer(S_IFREG | (mode & 0777)));
-    json_object_set_new(meta_json, "uid", json_integer(context ? context->uid : getuid()));
-    json_object_set_new(meta_json, "gid", json_integer(context ? context->gid : getgid()));
-    json_object_set_new(meta_json, "size", json_integer(0)); // Initial size 0
-    json_object_set_new(meta_json, "chunk_size", json_integer(HPKV_CHUNK_SIZE)); // Store chunk size
-    json_object_set_new(meta_json, "num_chunks", json_integer(0)); // Initial chunk count 0
-    time_t now = time(NULL);
-    json_object_set_new(meta_json, "atime", json_integer(now));
-    json_object_set_new(meta_json, "mtime", json_integer(now));
-    json_object_set_new(meta_json, "ctime", json_integer(now));
-
-    ret = post_metadata_json(path, meta_json);
-
-    // No need to create empty content key with chunking
-
-    DEBUG_LOG("hpkv_create: Finished for path: %s, returning %d\n", path, ret);
-    return ret;
-}
-
-// open: Open a file (Modified to handle O_TRUNC via truncate)
-static int hpkv_open(const char *path, struct fuse_file_info *fi) {
-    DEBUG_LOG("hpkv_open: Called for path: %s, flags: 0x%x\n", path, fi->flags);
-    int res;
-    struct stat stbuf;
-
-    res = hpkv_getattr(path, &stbuf);
-    if (res != 0) return res;
-
-    if (S_ISDIR(stbuf.st_mode)) {
-        if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EISDIR;
-    }
-
-    if (fi->flags & O_TRUNC) {
-        DEBUG_LOG("hpkv_open(%s): O_TRUNC flag set, calling truncate(0).\n", path);
-        res = hpkv_truncate(path, 0);
-        if (res != 0) {
-            fprintf(stderr, "Warning: hpkv_open(%s): Failed to truncate on open: %d\n", path, res);
-            // Don't fail open, but log warning.
+        if (http_code == 404) {
+            // If the directory prefix itself doesn't exist, it's not an error for readdir
+            DEBUG_LOG("hpkv_readdir(%s): Prefix not found (404), directory is empty or doesn't exist.\n", path);
+            ret = 0; // Treat as empty directory
+        } else {
+            fprintf(stderr, "Error: hpkv_readdir(%s): API GET failed, HTTP: %ld\n", path, http_code);
+            ret = map_http_to_fuse_error(http_code);
         }
     }
 
-    DEBUG_LOG("hpkv_open: Finished for path: %s, returning 0\n", path);
+    DEBUG_LOG("hpkv_readdir(%s): Finished with status %d\n", path, ret);
+    return ret;
+}
+
+static int hpkv_mkdir(const char *path, mode_t mode) {
+    DEBUG_LOG("hpkv_mkdir: Entered for path: %s, mode: %o\n", path, mode);
+    int ret = 0;
+    json_t *meta_json = NULL;
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_mkdir(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
+    // Check if it already exists
+    meta_json = get_metadata_json(path);
+    if (meta_json) {
+        json_decref(meta_json);
+        DEBUG_LOG("hpkv_mkdir(%s): Path already exists.\n", path);
+        return -EEXIST;
+    }
+
+    // Create new metadata JSON
+    meta_json = json_object();
+    if (!meta_json) {
+        fprintf(stderr, "Error: hpkv_mkdir(%s): Failed to create JSON object.\n", path);
+        return -ENOMEM;
+    }
+
+    time_t now = time(NULL);
+    json_object_set_new(meta_json, "mode", json_integer(S_IFDIR | (mode & 0777))); // Ensure DIR type, apply requested mode
+    json_object_set_new(meta_json, "uid", json_integer(context->uid));
+    json_object_set_new(meta_json, "gid", json_integer(context->gid));
+    json_object_set_new(meta_json, "size", json_integer(0));
+    json_object_set_new(meta_json, "atime", json_integer(now));
+    json_object_set_new(meta_json, "mtime", json_integer(now));
+    json_object_set_new(meta_json, "ctime", json_integer(now));
+    json_object_set_new(meta_json, "num_chunks", json_integer(0));
+    json_object_set_new(meta_json, "chunk_size", json_integer(HPKV_CHUNK_SIZE));
+
+    ret = post_metadata_json(path, meta_json);
+    json_decref(meta_json);
+
+    if (ret == 0) {
+        DEBUG_LOG("hpkv_mkdir(%s): Successfully created directory.\n", path);
+    } else {
+        fprintf(stderr, "Error: hpkv_mkdir(%s): Failed to post metadata (Error %d).\n", path, ret);
+    }
+    return ret;
+}
+
+static int hpkv_rmdir(const char *path) {
+    DEBUG_LOG("hpkv_rmdir: Entered for path: %s\n", path);
+    int ret = 0;
+    char meta_key[1024];
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_rmdir(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
+    // Basic check: prevent removing root
+    if (strcmp(path, "/") == 0) {
+        return -EPERM; // Operation not permitted
+    }
+
+    // TODO: Add check for directory emptiness. This requires listing keys with prefix path + "/"
+    // If any keys exist, return -ENOTEMPTY.
+    // For now, we just attempt to delete the metadata.
+
+    get_meta_key(path, meta_key, sizeof(meta_key));
+    ret = delete_hpkv_key(meta_key);
+
+    if (ret == 0) {
+        DEBUG_LOG("hpkv_rmdir(%s): Successfully deleted directory metadata.\n", path);
+    } else {
+        fprintf(stderr, "Error: hpkv_rmdir(%s): Failed to delete metadata (Error %d).\n", path, ret);
+    }
+    return ret;
+}
+
+static int hpkv_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    (void) fi; // Unused parameter
+    DEBUG_LOG("hpkv_create: Entered for path: %s, mode: %o\n", path, mode);
+    int ret = 0;
+    json_t *meta_json = NULL;
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_create(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
+    // Check if it already exists
+    meta_json = get_metadata_json(path);
+    if (meta_json) {
+        json_decref(meta_json);
+        DEBUG_LOG("hpkv_create(%s): Path already exists.\n", path);
+        return -EEXIST;
+    }
+
+    // Create new metadata JSON for an empty file
+    meta_json = json_object();
+    if (!meta_json) {
+        fprintf(stderr, "Error: hpkv_create(%s): Failed to create JSON object.\n", path);
+        return -ENOMEM;
+    }
+
+    time_t now = time(NULL);
+    json_object_set_new(meta_json, "mode", json_integer(S_IFREG | (mode & 0777))); // Ensure REG type, apply requested mode
+    json_object_set_new(meta_json, "uid", json_integer(context->uid));
+    json_object_set_new(meta_json, "gid", json_integer(context->gid));
+    json_object_set_new(meta_json, "size", json_integer(0)); // New file, 0 size
+    json_object_set_new(meta_json, "atime", json_integer(now));
+    json_object_set_new(meta_json, "mtime", json_integer(now));
+    json_object_set_new(meta_json, "ctime", json_integer(now));
+    json_object_set_new(meta_json, "num_chunks", json_integer(0)); // No chunks yet
+    json_object_set_new(meta_json, "chunk_size", json_integer(HPKV_CHUNK_SIZE));
+
+    ret = post_metadata_json(path, meta_json);
+    json_decref(meta_json);
+
+    if (ret == 0) {
+        DEBUG_LOG("hpkv_create(%s): Successfully created file metadata.\n", path);
+    } else {
+        fprintf(stderr, "Error: hpkv_create(%s): Failed to post metadata (Error %d).\n", path, ret);
+    }
+    return ret;
+}
+
+static int hpkv_open(const char *path, struct fuse_file_info *fi) {
+    DEBUG_LOG("hpkv_open: Entered for path: %s, flags: 0x%x\n", path, fi->flags);
+    int ret = 0;
+    json_t *meta_json = NULL;
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_open(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
+    // Check if file exists
+    meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        DEBUG_LOG("hpkv_open(%s): File not found.\n", path);
+        return -ENOENT;
+    }
+
+    // Handle O_TRUNC flag: If file is opened for writing and O_TRUNC is set, truncate it.
+    if ((fi->flags & O_WRONLY || fi->flags & O_RDWR) && (fi->flags & O_TRUNC)) {
+        DEBUG_LOG("hpkv_open(%s): O_TRUNC flag set, truncating file to 0.\n", path);
+        json_object_set(meta_json, "size", json_integer(0));
+        json_object_set(meta_json, "num_chunks", json_integer(0));
+        // Update mtime and ctime
+        time_t now = time(NULL);
+        json_object_set(meta_json, "mtime", json_integer(now));
+        json_object_set(meta_json, "ctime", json_integer(now));
+
+        ret = post_metadata_json(path, meta_json);
+        if (ret != 0) {
+            fprintf(stderr, "Error: hpkv_open(%s): Failed to post metadata after O_TRUNC (Error %d).\n", path, ret);
+            json_decref(meta_json);
+            return ret;
+        }
+        // TODO: Delete existing chunk keys? Truncate handles this, maybe redundant here.
+        // For simplicity, let truncate handle chunk deletion later if needed.
+    }
+
+    json_decref(meta_json);
+    DEBUG_LOG("hpkv_open(%s): Open successful.\n", path);
     return 0; // Success
 }
 
-// read: Read data from a file (Modified for chunking)
 static int hpkv_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    DEBUG_LOG("hpkv_read: Called for path: %s, size: %zu, offset: %ld\n", path, size, offset);
-    (void) fi;
-    // int ret = 0; // Unused variable removed
+    (void) fi; // Unused parameter
+    DEBUG_LOG("hpkv_read: Entered for path: %s, size: %zu, offset: %ld\n", path, size, offset);
+    int ret = 0;
     json_t *meta_json = NULL;
-    size_t file_size = 0;
+    off_t file_size = 0;
     int num_chunks = 0;
-    size_t bytes_read_total = 0;
+    size_t bytes_read = 0;
 
-    // 1. Get metadata to find total size and chunk info
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_read(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
     meta_json = get_metadata_json(path);
     if (!meta_json) {
-        DEBUG_LOG("hpkv_read(%s): Metadata not found. Returning -ENOENT.\n", path);
+        DEBUG_LOG("hpkv_read(%s): Metadata not found.\n", path);
         return -ENOENT;
     }
 
-    json_t *j_val = json_object_get(meta_json, "size");
-    if (json_is_integer(j_val)) file_size = (size_t)json_integer_value(j_val);
-    else { fprintf(stderr, "Warning: hpkv_read(%s): Missing or invalid 'size' in metadata.\n", path); }
+    file_size = (off_t)json_integer_value(json_object_get(meta_json, "size"));
+    num_chunks = (int)json_integer_value(json_object_get(meta_json, "num_chunks"));
+    json_decref(meta_json); // Done with metadata for now
 
-    j_val = json_object_get(meta_json, "num_chunks");
-    if (json_is_integer(j_val)) num_chunks = (int)json_integer_value(j_val);
-    else { fprintf(stderr, "Warning: hpkv_read(%s): Missing or invalid 'num_chunks' in metadata.\n", path); }
-    
-    // Chunk size from metadata (or default) - though we use HPKV_CHUNK_SIZE define mostly
-    // int chunk_size_meta = HPKV_CHUNK_SIZE;
-    // j_val = json_object_get(meta_json, "chunk_size");
-    // if (json_is_integer(j_val)) chunk_size_meta = (int)json_integer_value(j_val);
-
-    json_decref(meta_json); // Done with metadata
-
-    DEBUG_LOG("hpkv_read(%s): File size: %zu, Num chunks: %d\n", path, file_size, num_chunks);
-
-    // Check if offset is beyond file size
-    if ((size_t)offset >= file_size) {
-        DEBUG_LOG("hpkv_read(%s): Offset %ld is beyond file size %zu. Returning 0 bytes.\n", path, offset, file_size);
-        return 0; // Read past EOF
+    if (offset >= file_size) {
+        DEBUG_LOG("hpkv_read(%s): Offset (%ld) is beyond file size (%ld).\n", path, offset, file_size);
+        return 0; // Read past end of file
     }
 
-    // Calculate start and end chunks needed
-    int start_chunk_index = offset / HPKV_CHUNK_SIZE;
-    off_t end_offset = offset + size -1; // Inclusive end offset of the read request
-    if ((size_t)end_offset >= file_size) {
-        end_offset = file_size - 1; // Clamp to actual file end
+    // Adjust size if it goes beyond EOF
+    if (offset + (off_t)size > file_size) {
+        size = (size_t)(file_size - offset);
+        DEBUG_LOG("hpkv_read(%s): Adjusted size to %zu to avoid reading past EOF.\n", path, size);
     }
-    int end_chunk_index = (file_size == 0) ? 0 : end_offset / HPKV_CHUNK_SIZE;
 
-    DEBUG_LOG("hpkv_read(%s): Reading from chunk %d to %d.\n", path, start_chunk_index, end_chunk_index);
+    int start_chunk = offset / HPKV_CHUNK_SIZE;
+    int end_chunk = (offset + size - 1) / HPKV_CHUNK_SIZE;
+    if (end_chunk < 0) end_chunk = 0; // Handle size=0 case
 
-    // 2. Iterate through required chunks and copy data
-    for (int i = start_chunk_index; i <= end_chunk_index; ++i) {
-        size_t chunk_content_len = 0;
-        char *chunk_content = get_chunk_content(path, i, &chunk_content_len);
+    DEBUG_LOG("hpkv_read(%s): Reading from chunk %d to %d.\n", path, start_chunk, end_chunk);
 
-        if (!chunk_content || chunk_content_len == 0) {
-            // If a chunk is missing or empty (shouldn't happen for middle chunks ideally)
-            fprintf(stderr, "Warning: hpkv_read(%s): Chunk %d missing or empty.\n", path, i);
-            if (chunk_content) free(chunk_content);
-            // Treat as if it contained zeros? Or return error?
-            // Let's assume zeros for now, but this indicates inconsistency.
-            chunk_content = NULL; // Ensure we don't use freed pointer
-            chunk_content_len = 0;
-            // If it's the *first* chunk we try to read and it's missing, maybe return error?
-            if (i == start_chunk_index && bytes_read_total == 0) {
-                 DEBUG_LOG("hpkv_read(%s): First required chunk %d missing. Returning EIO.\n", path, i);
-                 return -EIO; // Indicate I/O error if essential chunk missing
-            }
+    for (int i = start_chunk; i <= end_chunk; ++i) {
+        struct MemoryStruct chunk_data = get_chunk_content(path, i);
+        if (!chunk_data.memory) {
+            fprintf(stderr, "Error: hpkv_read(%s): Failed to get content for chunk %d.\n", path, i);
+            // Treat missing chunk as error? Or zero-filled? Let's return error for now.
+            return -EIO;
         }
 
-        // Calculate the offset within this chunk where reading starts
-        off_t chunk_start_offset_global = (off_t)i * HPKV_CHUNK_SIZE;
-        off_t read_start_in_chunk = (offset > chunk_start_offset_global) ? (offset - chunk_start_offset_global) : 0;
+        off_t chunk_start_offset = (off_t)i * HPKV_CHUNK_SIZE;
+        off_t read_start_in_chunk = 0;
+        size_t read_len_in_chunk = chunk_data.size;
 
-        // Calculate the offset within this chunk where reading ends (relative to chunk start)
-        off_t read_end_in_chunk_global = offset + bytes_read_total + (size - bytes_read_total) - 1;
-        if ((size_t)read_end_in_chunk_global >= file_size) read_end_in_chunk_global = file_size - 1;
-        off_t read_end_in_chunk = read_end_in_chunk_global - chunk_start_offset_global;
-        if (read_end_in_chunk >= (off_t)chunk_content_len) read_end_in_chunk = chunk_content_len - 1;
-        
-        // Calculate number of bytes to copy from this chunk
-        size_t bytes_to_copy_from_chunk = 0;
-        if (read_end_in_chunk >= read_start_in_chunk) {
-             bytes_to_copy_from_chunk = read_end_in_chunk - read_start_in_chunk + 1;
+        // Calculate the starting position within this chunk
+        if (offset > chunk_start_offset) {
+            read_start_in_chunk = offset - chunk_start_offset;
         }
 
-        // Ensure we don't copy more than remaining buffer space or available chunk data
-        if (bytes_to_copy_from_chunk > (size - bytes_read_total)) {
-            bytes_to_copy_from_chunk = size - bytes_read_total;
+        // Calculate how much to read from this chunk
+        if (read_start_in_chunk >= chunk_data.size) {
+            // Offset starts after this chunk ends, should not happen with correct loop bounds
+            free(chunk_data.memory);
+            continue;
         }
-        if (read_start_in_chunk + bytes_to_copy_from_chunk > chunk_content_len) {
-             // This case might happen if chunk was missing/shorter than expected
-             if (read_start_in_chunk >= (off_t)chunk_content_len) {
-                 bytes_to_copy_from_chunk = 0; // Trying to read past end of (missing/short) chunk
+        read_len_in_chunk = chunk_data.size - read_start_in_chunk;
+
+        // Don't read more than requested total size
+        if (bytes_read + read_len_in_chunk > size) {
+            read_len_in_chunk = size - bytes_read;
+        }
+
+        DEBUG_LOG("hpkv_read(%s): Reading %zu bytes from chunk %d (offset %ld in chunk).\n", 
+                  path, read_len_in_chunk, i, read_start_in_chunk);
+
+        if (read_len_in_chunk > 0) {
+            memcpy(buf + bytes_read, chunk_data.memory + read_start_in_chunk, read_len_in_chunk);
+            bytes_read += read_len_in_chunk;
+        }
+
+        free(chunk_data.memory);
+
+        if (bytes_read >= size) {
+            break; // We have read enough
+        }
+    }
+
+    DEBUG_LOG("hpkv_read(%s): Total bytes read: %zu\n", path, bytes_read);
+    return (int)bytes_read; // Return number of bytes read
+}
+
+static int hpkv_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    (void) fi; // Unused parameter
+    DEBUG_LOG("hpkv_write: Entered for path: %s, size: %zu, offset: %ld\n", path, size, offset);
+    int ret = 0;
+    json_t *meta_json = NULL;
+    off_t original_file_size = 0;
+    int original_num_chunks = 0;
+    size_t bytes_written = 0;
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_write(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
+
+    meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        DEBUG_LOG("hpkv_write(%s): Metadata not found.\n", path);
+        return -ENOENT;
+    }
+
+    original_file_size = (off_t)json_integer_value(json_object_get(meta_json, "size"));
+    original_num_chunks = (int)json_integer_value(json_object_get(meta_json, "num_chunks"));
+
+    int start_chunk = offset / HPKV_CHUNK_SIZE;
+    int end_chunk = (offset + size - 1) / HPKV_CHUNK_SIZE;
+    if (end_chunk < 0) end_chunk = 0; // Handle size=0 case
+
+    DEBUG_LOG("hpkv_write(%s): Writing from chunk %d to %d.\n", path, start_chunk, end_chunk);
+
+    for (int i = start_chunk; i <= end_chunk; ++i) {
+        off_t chunk_start_offset = (off_t)i * HPKV_CHUNK_SIZE;
+        off_t write_start_in_chunk = 0;
+        size_t write_len_in_chunk = 0;
+        size_t current_chunk_content_size = 0;
+        char *current_chunk_content = NULL;
+        struct MemoryStruct chunk_data = {NULL, 0};
+
+        // Calculate the starting position for writing within this chunk
+        if (offset > chunk_start_offset) {
+            write_start_in_chunk = offset - chunk_start_offset;
+        }
+
+        // Calculate how much data from the input buffer goes into this chunk
+        size_t remaining_size_in_buffer = size - bytes_written;
+        size_t space_left_in_chunk = HPKV_CHUNK_SIZE - write_start_in_chunk;
+        write_len_in_chunk = (remaining_size_in_buffer < space_left_in_chunk) ? remaining_size_in_buffer : space_left_in_chunk;
+
+        if (write_len_in_chunk == 0 && (offset + (off_t)size) > chunk_start_offset) {
+             // This can happen if the write ends exactly at a chunk boundary
+             // or if size is 0. No need to process this chunk further unless extending.
+             if (offset + (off_t)size > original_file_size && i >= original_num_chunks) {
+                 // Need to potentially create an empty chunk if extending file size
+                 DEBUG_LOG("hpkv_write(%s): Write ends at boundary or size 0, potentially creating empty chunk %d.\n", path, i);
              } else {
-                 bytes_to_copy_from_chunk = chunk_content_len - read_start_in_chunk;
+                 continue;
              }
         }
 
-        DEBUG_LOG("hpkv_read(%s): Chunk %d: len=%zu, read_start=%ld, read_end=%ld, copy_bytes=%zu\n", 
-                  path, i, chunk_content_len, read_start_in_chunk, read_end_in_chunk, bytes_to_copy_from_chunk);
+        // Determine the required size of the chunk after writing
+        size_t new_chunk_size = write_start_in_chunk + write_len_in_chunk;
 
-        if (bytes_to_copy_from_chunk > 0) {
-            if (chunk_content) {
-                memcpy(buf + bytes_read_total, chunk_content + read_start_in_chunk, bytes_to_copy_from_chunk);
-            } else {
-                // If chunk was missing, fill buffer with zeros
-                memset(buf + bytes_read_total, 0, bytes_to_copy_from_chunk);
-            }
-            bytes_read_total += bytes_to_copy_from_chunk;
-        }
-
-        if (chunk_content) free(chunk_content);
-
-        // Stop if we have read the requested size
-        if (bytes_read_total >= size) {
-            break;
-        }
-    }
-
-    DEBUG_LOG("hpkv_read: Finished for path: %s, returning bytes read %zu\n", path, bytes_read_total);
-    return bytes_read_total;
-}
-
-// write: Write data to a file (Modified for chunking)
-static int hpkv_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    DEBUG_LOG("hpkv_write: Called for path: %s, size: %zu, offset: %ld\n", path, size, offset);
-    (void) fi;
-    int ret = 0;
-    json_t *meta_json = NULL;
-    size_t current_file_size = 0;
-    int current_num_chunks = 0;
-    size_t bytes_written_total = 0;
-    off_t write_end_offset = offset + size; // Exclusive end offset
-
-    // 1. Get current metadata
-    meta_json = get_metadata_json(path);
-    if (!meta_json) {
-        DEBUG_LOG("hpkv_write(%s): Metadata not found. Returning -ENOENT.\n", path);
-        return -ENOENT;
-    }
-
-    json_t *j_val = json_object_get(meta_json, "size");
-    if (json_is_integer(j_val)) current_file_size = (size_t)json_integer_value(j_val);
-    j_val = json_object_get(meta_json, "num_chunks");
-    if (json_is_integer(j_val)) current_num_chunks = (int)json_integer_value(j_val);
-    // int chunk_size_meta = HPKV_CHUNK_SIZE; // Use define
-
-    DEBUG_LOG("hpkv_write(%s): Current size: %zu, Num chunks: %d\n", path, current_file_size, current_num_chunks);
-
-    // Calculate new potential size and required chunks
-    // Use explicit casts for comparisons involving off_t and size_t
-    size_t new_potential_size = (write_end_offset > (off_t)current_file_size) ? (size_t)write_end_offset : current_file_size;
-    int new_num_chunks = (new_potential_size + HPKV_CHUNK_SIZE - 1) / HPKV_CHUNK_SIZE;
-    if (new_potential_size == 0) new_num_chunks = 0; // Special case for empty file
-
-    DEBUG_LOG("hpkv_write(%s): New potential size: %zu, New num chunks: %d\n", path, new_potential_size, new_num_chunks);
-
-    // Calculate start and end chunks affected by this write
-    int start_chunk_index = offset / HPKV_CHUNK_SIZE;
-    int end_chunk_index = (write_end_offset > 0) ? (write_end_offset - 1) / HPKV_CHUNK_SIZE : 0;
-    if (write_end_offset == 0) end_chunk_index = -1; // Handle writing 0 bytes at offset 0
-
-    DEBUG_LOG("hpkv_write(%s): Writing to chunks %d through %d.\n", path, start_chunk_index, end_chunk_index);
-
-    // 2. Iterate through affected chunks
-    for (int i = start_chunk_index; i <= end_chunk_index; ++i) {
-        size_t chunk_content_len = 0;
-        char *current_chunk_content = NULL;
-        char new_chunk_data[HPKV_CHUNK_SIZE];
-        size_t new_chunk_len = 0;
-
-        // Calculate offsets and lengths relative to this chunk
-        off_t chunk_start_offset_global = (off_t)i * HPKV_CHUNK_SIZE;
-        off_t write_start_in_chunk = (offset > chunk_start_offset_global) ? (offset - chunk_start_offset_global) : 0;
-        size_t bytes_to_write_in_chunk = HPKV_CHUNK_SIZE - write_start_in_chunk;
-        if (bytes_to_write_in_chunk > (size - bytes_written_total)) {
-            bytes_to_write_in_chunk = size - bytes_written_total;
-        }
-
-        DEBUG_LOG("hpkv_write(%s): Chunk %d: write_start=%ld, write_bytes=%zu\n", 
-                  path, i, write_start_in_chunk, bytes_to_write_in_chunk);
-
-        // Determine if we need to read the existing chunk
+        // Do we need to read the existing chunk content?
+        // Yes, if the write doesn't start at the beginning of the chunk OR
+        // if the write doesn't completely overwrite the chunk up to its previous size (if it existed).
         int need_read = 0;
-        if (write_start_in_chunk > 0) need_read = 1; // Writing past the start
-        off_t chunk_end_write_offset = write_start_in_chunk + bytes_to_write_in_chunk;
-        // If not writing to the very end of the chunk AND the write doesn't reach the file end
-        if (chunk_end_write_offset < HPKV_CHUNK_SIZE && 
-            (chunk_start_offset_global + chunk_end_write_offset) < (off_t)current_file_size) {
-             need_read = 1; 
-        }
-        // If the chunk potentially exists beyond the current write area (fix comparison)
-        if (i < current_num_chunks && 
-            (chunk_start_offset_global + HPKV_CHUNK_SIZE) > (off_t)current_file_size && 
-            chunk_end_write_offset < (off_t)(current_file_size % HPKV_CHUNK_SIZE)){
-             need_read = 1;
+        if (write_start_in_chunk > 0) {
+            need_read = 1;
+        } else if (i < original_num_chunks) {
+            // Check if we need the tail end of the existing chunk
+            off_t chunk_original_end = chunk_start_offset + HPKV_CHUNK_SIZE; // Theoretical end
+            if (i == original_num_chunks - 1) { // Last original chunk
+                chunk_original_end = original_file_size;
+            }
+            off_t write_end_in_chunk_abs = offset + bytes_written + write_len_in_chunk;
+            if (write_end_in_chunk_abs < chunk_original_end) {
+                 need_read = 1;
+            }
         }
 
         if (need_read) {
-            DEBUG_LOG("hpkv_write(%s): Chunk %d: Need to read existing content.\n", path, i);
-            current_chunk_content = get_chunk_content(path, i, &chunk_content_len);
-            if (!current_chunk_content) {
-                // If read fails but we needed it, maybe zero-fill?
-                fprintf(stderr, "Warning: hpkv_write(%s): Failed to read chunk %d needed for partial write. Assuming zeros.\n", path, i);
-                chunk_content_len = 0;
-                // Allocate buffer to hold zeros if needed for prefix
-                if (write_start_in_chunk > 0) {
-                     current_chunk_content = calloc(write_start_in_chunk, 1);
-                     if (current_chunk_content) chunk_content_len = write_start_in_chunk;
-                     else { ret = -ENOMEM; goto write_cleanup; }
-                } else {
-                     current_chunk_content = NULL;
+            DEBUG_LOG("hpkv_write(%s): Need to read existing content for chunk %d.\n", path, i);
+            chunk_data = get_chunk_content(path, i);
+            if (chunk_data.memory) {
+                current_chunk_content = chunk_data.memory;
+                current_chunk_content_size = chunk_data.size;
+                // Ensure the buffer is large enough for the write
+                if (new_chunk_size > current_chunk_content_size) {
+                    char *new_ptr = realloc(current_chunk_content, new_chunk_size);
+                    if (!new_ptr) {
+                        fprintf(stderr, "Error: hpkv_write(%s): Failed to realloc chunk buffer for chunk %d.\n", path, i);
+                        if (current_chunk_content) free(current_chunk_content);
+                        ret = -ENOMEM;
+                        goto write_cleanup;
+                    }
+                    current_chunk_content = new_ptr;
+                    // Zero out the potentially extended part if write doesn't cover it
+                    if (write_start_in_chunk > current_chunk_content_size) {
+                         memset(current_chunk_content + current_chunk_content_size, 0, write_start_in_chunk - current_chunk_content_size);
+                    }
                 }
+            } else {
+                // Chunk didn't exist or failed to read, create a new buffer
+                current_chunk_content = calloc(1, new_chunk_size);
+                if (!current_chunk_content) {
+                    fprintf(stderr, "Error: hpkv_write(%s): Failed to calloc chunk buffer for chunk %d.\n", path, i);
+                    ret = -ENOMEM;
+                    goto write_cleanup;
+                }
+                current_chunk_content_size = 0; // Treat as empty initially
             }
         } else {
-             DEBUG_LOG("hpkv_write(%s): Chunk %d: Overwriting or writing new chunk, no read needed.\n", path, i);
-             current_chunk_content = NULL;
-             chunk_content_len = 0;
+            // No need to read, create a new buffer just for the written data
+            current_chunk_content = malloc(new_chunk_size);
+            if (!current_chunk_content) {
+                fprintf(stderr, "Error: hpkv_write(%s): Failed to malloc chunk buffer for chunk %d.\n", path, i);
+                ret = -ENOMEM;
+                goto write_cleanup;
+            }
+            current_chunk_content_size = 0; // Will be overwritten
         }
 
-        // Prepare the new chunk data
-        // Case 1: Overwriting entire chunk or writing new chunk
-        if (!need_read) {
-            memcpy(new_chunk_data, buf + bytes_written_total, bytes_to_write_in_chunk);
-            new_chunk_len = bytes_to_write_in_chunk;
-        } 
-        // Case 2: Partial write (need prefix and/or suffix)
-        else {
-            // Determine the final length of the modified chunk
-            new_chunk_len = chunk_content_len;
-            if (write_start_in_chunk + bytes_to_write_in_chunk > new_chunk_len) {
-                new_chunk_len = write_start_in_chunk + bytes_to_write_in_chunk;
-            }
-            if (new_chunk_len > HPKV_CHUNK_SIZE) new_chunk_len = HPKV_CHUNK_SIZE; // Should not exceed
-
-            // Copy prefix from old chunk if needed
-            // Use explicit cast for comparison
-            size_t prefix_len = (write_start_in_chunk < (off_t)chunk_content_len) ? (size_t)write_start_in_chunk : chunk_content_len;
-            if (prefix_len > 0 && current_chunk_content) {
-                memcpy(new_chunk_data, current_chunk_content, prefix_len);
-            }
-            // Zero fill gap if write starts after current chunk end
-            if (write_start_in_chunk > (off_t)chunk_content_len) {
-                 memset(new_chunk_data + chunk_content_len, 0, write_start_in_chunk - chunk_content_len);
-            }
-
-            // Copy the new data being written
-            memcpy(new_chunk_data + write_start_in_chunk, buf + bytes_written_total, bytes_to_write_in_chunk);
-
-            // Copy suffix from old chunk if needed
-            size_t suffix_start_in_chunk = write_start_in_chunk + bytes_to_write_in_chunk;
-            if (suffix_start_in_chunk < chunk_content_len && current_chunk_content) {
-                memcpy(new_chunk_data + suffix_start_in_chunk, 
-                       current_chunk_content + suffix_start_in_chunk, 
-                       chunk_content_len - suffix_start_in_chunk);
-            }
+        // Perform the write into the chunk buffer
+        if (write_len_in_chunk > 0) {
+             DEBUG_LOG("hpkv_write(%s): Writing %zu bytes to chunk %d buffer at offset %ld.\n", 
+                       path, write_len_in_chunk, i, write_start_in_chunk);
+             memcpy(current_chunk_content + write_start_in_chunk, buf + bytes_written, write_len_in_chunk);
         }
 
-        // Write the modified chunk back to HPKV
-        DEBUG_LOG("hpkv_write(%s): Chunk %d: Posting updated content, length %zu.\n", path, i, new_chunk_len);
-        ret = post_chunk_content(path, i, new_chunk_data, new_chunk_len);
-        if (current_chunk_content) free(current_chunk_content);
+        // Post the potentially modified chunk back to HPKV
+        DEBUG_LOG("hpkv_write(%s): Posting chunk %d (new size %zu).\n", path, i, new_chunk_size);
+        ret = post_chunk_content(path, i, current_chunk_content, new_chunk_size);
+        free(current_chunk_content);
+        current_chunk_content = NULL;
 
         if (ret != 0) {
-            fprintf(stderr, "Error: hpkv_write(%s): Failed to post chunk %d. Aborting write. FUSE error: %d\n", path, i, ret);
-            goto write_cleanup; // Abort on chunk write failure
+            fprintf(stderr, "Error: hpkv_write(%s): Failed to post content for chunk %d (Error %d).\n", path, i, ret);
+            goto write_cleanup;
         }
 
-        bytes_written_total += bytes_to_write_in_chunk;
+        bytes_written += write_len_in_chunk;
     }
 
-    // 3. Update metadata (size, num_chunks, mtime, ctime)
-    DEBUG_LOG("hpkv_write(%s): All chunks written. Updating metadata...\n", path);
-    time_t now = time(NULL);
-    json_object_set_new(meta_json, "size", json_integer(new_potential_size));
-    json_object_set_new(meta_json, "num_chunks", json_integer(new_num_chunks));
-    json_object_set_new(meta_json, "mtime", json_integer(now));
-    json_object_set_new(meta_json, "ctime", json_integer(now));
+    // Update metadata (size, num_chunks, mtime, ctime)
+    off_t new_file_size = offset + size;
+    if (new_file_size < original_file_size) {
+        new_file_size = original_file_size; // Write doesn't shrink file, use truncate for that
+    }
+    int new_num_chunks = (new_file_size + HPKV_CHUNK_SIZE - 1) / HPKV_CHUNK_SIZE;
+    if (new_file_size == 0) new_num_chunks = 0;
 
-    ret = post_metadata_json(path, meta_json); // Takes ownership of meta_json
-    meta_json = NULL; // Avoid double decref in cleanup
+    DEBUG_LOG("hpkv_write(%s): Updating metadata. Original size=%ld, New potential size=%ld. Original chunks=%d, New chunks=%d.\n", 
+              path, original_file_size, new_file_size, original_num_chunks, new_num_chunks);
+
+    json_object_set(meta_json, "size", json_integer(new_file_size));
+    json_object_set(meta_json, "num_chunks", json_integer(new_num_chunks));
+    time_t now = time(NULL);
+    json_object_set(meta_json, "mtime", json_integer(now));
+    json_object_set(meta_json, "ctime", json_integer(now));
+
+    ret = post_metadata_json(path, meta_json);
     if (ret != 0) {
-        fprintf(stderr, "Warning: hpkv_write(%s): Failed to update metadata after writing content (FUSE error %d). Metadata might be inconsistent.\n", path, ret);
-        // Return bytes written, but log warning.
+        fprintf(stderr, "Error: hpkv_write(%s): Failed to post updated metadata (Error %d).\n", path, ret);
+    } else {
+        DEBUG_LOG("hpkv_write(%s): Successfully wrote %zu bytes.\n", path, bytes_written);
+        ret = (int)bytes_written; // Return number of bytes written on success
     }
 
 write_cleanup:
-    if (meta_json) json_decref(meta_json); // Decref if not consumed by post_metadata_json
-
-    if (ret == 0) {
-        DEBUG_LOG("hpkv_write: Finished for path: %s, returning written size %zu\n", path, size);
-        return size; // Return number of bytes requested to write on success
-    } else {
-        DEBUG_LOG("hpkv_write: Finished for path: %s with error, returning %d\n", path, ret);
-        return ret; // Return negative error code on failure
-    }
+    if (meta_json) json_decref(meta_json);
+    return ret;
 }
 
-// truncate: Change the size of a file (Modified for chunking)
 static int hpkv_truncate(const char *path, off_t size) {
-    DEBUG_LOG("hpkv_truncate: Called for path: %s, size: %ld\n", path, size);
+    DEBUG_LOG("hpkv_truncate: Entered for path: %s, size: %ld\n", path, size);
     int ret = 0;
     json_t *meta_json = NULL;
-    size_t current_file_size = 0;
-    int current_num_chunks = 0;
-    size_t new_size = (size_t)size;
+    off_t original_file_size = 0;
+    int original_num_chunks = 0;
 
-    if (size < 0) return -EINVAL;
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_truncate(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
 
-    // 1. Get current metadata
     meta_json = get_metadata_json(path);
     if (!meta_json) {
-        DEBUG_LOG("hpkv_truncate(%s): Metadata not found. Returning -ENOENT.\n", path);
+        DEBUG_LOG("hpkv_truncate(%s): Metadata not found.\n", path);
         return -ENOENT;
     }
 
-    json_t *j_val = json_object_get(meta_json, "size");
-    if (json_is_integer(j_val)) current_file_size = (size_t)json_integer_value(j_val);
-    j_val = json_object_get(meta_json, "num_chunks");
-    if (json_is_integer(j_val)) current_num_chunks = (int)json_integer_value(j_val);
+    original_file_size = (off_t)json_integer_value(json_object_get(meta_json, "size"));
+    original_num_chunks = (int)json_integer_value(json_object_get(meta_json, "num_chunks"));
 
-    DEBUG_LOG("hpkv_truncate(%s): Current size: %zu, Num chunks: %d. Target size: %zu\n", 
-              path, current_file_size, current_num_chunks, new_size);
-
-    // If size is the same, just update times
-    if (current_file_size == new_size) {
-        DEBUG_LOG("hpkv_truncate(%s): Size unchanged. Updating metadata times only.\n", path);
-        goto update_metadata_only;
+    if (size == original_file_size) {
+        DEBUG_LOG("hpkv_truncate(%s): Size unchanged, nothing to do.\n", path);
+        json_decref(meta_json);
+        return 0; // No change needed
     }
 
-    // Calculate new number of chunks
-    int new_num_chunks = (new_size + HPKV_CHUNK_SIZE - 1) / HPKV_CHUNK_SIZE;
-    if (new_size == 0) new_num_chunks = 0;
+    int new_num_chunks = (size + HPKV_CHUNK_SIZE - 1) / HPKV_CHUNK_SIZE;
+    if (size == 0) new_num_chunks = 0;
 
-    DEBUG_LOG("hpkv_truncate(%s): New num chunks: %d\n", path, new_num_chunks);
+    DEBUG_LOG("hpkv_truncate(%s): Original size=%ld, New size=%ld. Original chunks=%d, New chunks=%d.\n", 
+              path, original_file_size, size, original_num_chunks, new_num_chunks);
 
-    // 2. Handle shrinking
-    if (new_size < current_file_size) {
-        DEBUG_LOG("hpkv_truncate(%s): Shrinking file.\n", path);
-        // Delete chunks beyond the new end
-        for (int i = new_num_chunks; i < current_num_chunks; ++i) {
-            DEBUG_LOG("hpkv_truncate(%s): Deleting chunk %d\n", path, i);
-            ret = delete_chunk_content(path, i);
-            if (ret != 0) {
-                fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to delete chunk %d during shrink (FUSE %d). Continuing...\n", path, i, ret);
-                // Continue deleting other chunks if possible
-            }
+    // Handle shrinking the file
+    if (size < original_file_size) {
+        // Delete excess chunks
+        for (int i = new_num_chunks; i < original_num_chunks; ++i) {
+            char chunk_key[1024];
+            get_chunk_key(path, i, chunk_key, sizeof(chunk_key));
+            DEBUG_LOG("hpkv_truncate(%s): Deleting chunk %d (%s).\n", path, i, chunk_key);
+            // Ignore errors here? If delete fails, metadata update will still happen.
+            delete_hpkv_key(chunk_key);
         }
         // Truncate the last remaining chunk if necessary
         if (new_num_chunks > 0) {
             int last_chunk_index = new_num_chunks - 1;
-            size_t size_in_last_chunk = new_size % HPKV_CHUNK_SIZE;
-            if (size_in_last_chunk == 0 && new_size > 0) size_in_last_chunk = HPKV_CHUNK_SIZE; // Full last chunk
+            off_t last_chunk_offset = (off_t)last_chunk_index * HPKV_CHUNK_SIZE;
+            size_t size_in_last_chunk = size - last_chunk_offset;
             
-            size_t current_last_chunk_len = 0;
-            char *last_chunk_content = get_chunk_content(path, last_chunk_index, &current_last_chunk_len);
-
-            if (last_chunk_content) {
-                if (current_last_chunk_len > size_in_last_chunk) {
-                    DEBUG_LOG("hpkv_truncate(%s): Truncating last chunk %d from %zu to %zu bytes.\n", 
-                              path, last_chunk_index, current_last_chunk_len, size_in_last_chunk);
-                    ret = post_chunk_content(path, last_chunk_index, last_chunk_content, size_in_last_chunk);
-                    if (ret != 0) {
-                         fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to post truncated last chunk %d (FUSE %d).\n", path, last_chunk_index, ret);
-                    }
-                } else {
-                     DEBUG_LOG("hpkv_truncate(%s): Last chunk %d size (%zu) already <= target size in chunk (%zu). No content change needed.\n", 
-                               path, last_chunk_index, current_last_chunk_len, size_in_last_chunk);
+            struct MemoryStruct chunk_data = get_chunk_content(path, last_chunk_index);
+            if (chunk_data.memory && chunk_data.size > size_in_last_chunk) {
+                DEBUG_LOG("hpkv_truncate(%s): Truncating content of last chunk %d to %zu bytes.\n", 
+                          path, last_chunk_index, size_in_last_chunk);
+                ret = post_chunk_content(path, last_chunk_index, chunk_data.memory, size_in_last_chunk);
+                free(chunk_data.memory);
+                if (ret != 0) {
+                    fprintf(stderr, "Error: hpkv_truncate(%s): Failed to post truncated last chunk %d (Error %d).\n", 
+                              path, last_chunk_index, ret);
+                    goto truncate_cleanup; // Abort if we can't write the truncated chunk
                 }
-                free(last_chunk_content);
+            } else if (chunk_data.memory) {
+                 free(chunk_data.memory); // No truncation needed for this chunk's content
             } else {
-                 fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to get last chunk %d content during shrink.\n", path, last_chunk_index);
-                 // If we couldn't get the last chunk, we can't truncate it. Metadata update will reflect new size.
-            }
-        }
-    }
-    // 3. Handle extending
-    else { // new_size > current_file_size
-        DEBUG_LOG("hpkv_truncate(%s): Extending file.\n", path);
-        // Zero-pad the last existing chunk if needed
-        if (current_num_chunks > 0) {
-            int last_chunk_index = current_num_chunks - 1;
-            size_t size_in_last_chunk = current_file_size % HPKV_CHUNK_SIZE;
-            if (size_in_last_chunk == 0 && current_file_size > 0) size_in_last_chunk = HPKV_CHUNK_SIZE;
-
-            if (size_in_last_chunk < HPKV_CHUNK_SIZE) {
-                size_t current_last_chunk_len = 0;
-                char *last_chunk_content = get_chunk_content(path, last_chunk_index, &current_last_chunk_len);
-                if (last_chunk_content) {
-                    if (current_last_chunk_len < HPKV_CHUNK_SIZE) {
-                        size_t bytes_to_pad = HPKV_CHUNK_SIZE - current_last_chunk_len;
-                        // Only pad up to the end of the chunk if the new size is within this chunk
-                        if (last_chunk_index == new_num_chunks - 1) {
-                             size_t final_size_in_chunk = new_size % HPKV_CHUNK_SIZE;
-                             if (final_size_in_chunk == 0) final_size_in_chunk = HPKV_CHUNK_SIZE;
-                             if (final_size_in_chunk < HPKV_CHUNK_SIZE) {
-                                 bytes_to_pad = final_size_in_chunk - current_last_chunk_len;
-                             }
-                        }
-                        if (bytes_to_pad > 0) {
-                            DEBUG_LOG("hpkv_truncate(%s): Padding last chunk %d from %zu with %zu zeros.\n", 
-                                      path, last_chunk_index, current_last_chunk_len, bytes_to_pad);
-                            char *padded_chunk = malloc(current_last_chunk_len + bytes_to_pad);
-                            if (padded_chunk) {
-                                memcpy(padded_chunk, last_chunk_content, current_last_chunk_len);
-                                memset(padded_chunk + current_last_chunk_len, 0, bytes_to_pad);
-                                ret = post_chunk_content(path, last_chunk_index, padded_chunk, current_last_chunk_len + bytes_to_pad);
-                                free(padded_chunk);
-                                if (ret != 0) {
-                                     fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to post padded last chunk %d (FUSE %d).\n", path, last_chunk_index, ret);
-                                }
-                            } else { ret = -ENOMEM; }
-                        }
-                    }
-                    free(last_chunk_content);
-                    if (ret != 0) goto truncate_cleanup; // Abort if padding failed
-                } else {
-                     fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to get last chunk %d content during extend padding.\n", path, last_chunk_index);
-                }
-            }
-        }
-        // Create new zero-filled chunks if needed
-        char zero_chunk[HPKV_CHUNK_SIZE];
-        memset(zero_chunk, 0, HPKV_CHUNK_SIZE);
-        for (int i = current_num_chunks; i < new_num_chunks; ++i) {
-            size_t size_to_write = HPKV_CHUNK_SIZE;
-            if (i == new_num_chunks - 1) { // Last new chunk
-                size_t size_in_last_chunk = new_size % HPKV_CHUNK_SIZE;
-                if (size_in_last_chunk == 0 && new_size > 0) size_in_last_chunk = HPKV_CHUNK_SIZE;
-                size_to_write = size_in_last_chunk;
-            }
-            if (size_to_write > 0) {
-                 DEBUG_LOG("hpkv_truncate(%s): Creating new zero chunk %d, size %zu\n", path, i, size_to_write);
-                 ret = post_chunk_content(path, i, zero_chunk, size_to_write);
-                 if (ret != 0) {
-                     fprintf(stderr, "Error: hpkv_truncate(%s): Failed to post new zero chunk %d (FUSE %d). Aborting extend.\n", path, i, ret);
-                     // Should we try to delete previously created chunks?
-                     goto truncate_cleanup;
+                 // Last chunk doesn't exist? This might happen if extending then shrinking.
+                 // Create an empty chunk of the correct size?
+                 // For simplicity, let's assume if size > 0, the chunk should exist or be created.
+                 // If size_in_last_chunk is 0, we don't need to do anything here.
+                 if (size_in_last_chunk > 0) {
+                     DEBUG_LOG("hpkv_truncate(%s): Last chunk %d missing, creating empty chunk of size %zu.\n", 
+                               path, last_chunk_index, size_in_last_chunk);
+                     char *empty_buf = calloc(1, size_in_last_chunk);
+                     if (!empty_buf) { ret = -ENOMEM; goto truncate_cleanup; }
+                     ret = post_chunk_content(path, last_chunk_index, empty_buf, size_in_last_chunk);
+                     free(empty_buf);
+                     if (ret != 0) {
+                         fprintf(stderr, "Error: hpkv_truncate(%s): Failed to post new empty last chunk %d (Error %d).\n", 
+                                   path, last_chunk_index, ret);
+                         goto truncate_cleanup;
+                     }
                  }
             }
         }
     }
+    // Handle extending the file (handled implicitly by write, but truncate might extend beyond last write)
+    else { // size > original_file_size
+        // If extending, ensure the last chunk exists and has the correct (potentially partial) size.
+        // Write operation usually handles extension, but truncate might be called independently.
+        if (new_num_chunks > 0) {
+            int last_chunk_index = new_num_chunks - 1;
+            off_t last_chunk_offset = (off_t)last_chunk_index * HPKV_CHUNK_SIZE;
+            size_t size_in_last_chunk = size - last_chunk_offset;
+            size_t current_last_chunk_size = 0;
+            struct MemoryStruct chunk_data = {NULL, 0};
 
-update_metadata_only:
-    // 4. Update metadata (size, num_chunks, mtime, ctime)
-    DEBUG_LOG("hpkv_truncate(%s): Updating metadata... New size: %zu, New num_chunks: %d\n", path, new_size, new_num_chunks);
+            if (last_chunk_index < original_num_chunks) {
+                 chunk_data = get_chunk_content(path, last_chunk_index);
+                 if (chunk_data.memory) {
+                     current_last_chunk_size = chunk_data.size;
+                 }
+            }
+
+            if (current_last_chunk_size < size_in_last_chunk) {
+                 DEBUG_LOG("hpkv_truncate(%s): Extending last chunk %d from %zu to %zu bytes.\n", 
+                           path, last_chunk_index, current_last_chunk_size, size_in_last_chunk);
+                 char *new_buf = calloc(1, size_in_last_chunk);
+                 if (!new_buf) { ret = -ENOMEM; if (chunk_data.memory) free(chunk_data.memory); goto truncate_cleanup; }
+                 if (chunk_data.memory) {
+                     memcpy(new_buf, chunk_data.memory, current_last_chunk_size);
+                     free(chunk_data.memory);
+                 }
+                 ret = post_chunk_content(path, last_chunk_index, new_buf, size_in_last_chunk);
+                 free(new_buf);
+                 if (ret != 0) {
+                     fprintf(stderr, "Error: hpkv_truncate(%s): Failed to post extended last chunk %d (Error %d).\n", 
+                               path, last_chunk_index, ret);
+                     goto truncate_cleanup;
+                 }
+            } else if (chunk_data.memory) {
+                 free(chunk_data.memory); // No extension needed for this chunk
+            }
+        }
+    }
+
+    // Update metadata (size, num_chunks, mtime, ctime)
+    json_object_set(meta_json, "size", json_integer(size));
+    json_object_set(meta_json, "num_chunks", json_integer(new_num_chunks));
     time_t now = time(NULL);
-    json_object_set_new(meta_json, "size", json_integer(new_size));
-    json_object_set_new(meta_json, "num_chunks", json_integer(new_num_chunks));
-    json_object_set_new(meta_json, "mtime", json_integer(now));
-    json_object_set_new(meta_json, "ctime", json_integer(now));
+    json_object_set(meta_json, "mtime", json_integer(now));
+    json_object_set(meta_json, "ctime", json_integer(now));
 
-    ret = post_metadata_json(path, meta_json); // Takes ownership of meta_json
-    meta_json = NULL; // Avoid double decref
+    ret = post_metadata_json(path, meta_json);
     if (ret != 0) {
-        fprintf(stderr, "Warning: hpkv_truncate(%s): Failed to update metadata after truncating content (FUSE error %d).\n", path, ret);
-        // Return success for truncate itself, but log warning.
-        ret = 0;
+        fprintf(stderr, "Error: hpkv_truncate(%s): Failed to post updated metadata (Error %d).\n", path, ret);
+    } else {
+        DEBUG_LOG("hpkv_truncate(%s): Successfully truncated file to size %ld.\n", path, size);
     }
 
 truncate_cleanup:
     if (meta_json) json_decref(meta_json);
-
-    DEBUG_LOG("hpkv_truncate: Finished for path: %s, returning %d\n", path, ret);
-    return ret; // Return 0 on success, error code otherwise
+    return ret;
 }
 
-// unlink: Delete a file (Modified for chunking)
 static int hpkv_unlink(const char *path) {
-    DEBUG_LOG("hpkv_unlink: Called for path: %s\n", path);
-    char meta_key[1024];
-    char api_path_meta[2048];
-    char *encoded_key = NULL;
-    struct MemoryStruct response_meta;
-    long http_code_meta;
-    int ret_meta = 0, ret_chunks = 0;
-    json_t *meta_json = NULL;
-    int num_chunks = 0;
-
-    // 1. Get metadata to find number of chunks
-    meta_json = get_metadata_json(path);
-    if (meta_json) {
-        json_t *j_val = json_object_get(meta_json, "num_chunks");
-        if (json_is_integer(j_val)) num_chunks = (int)json_integer_value(j_val);
-        json_decref(meta_json);
-        DEBUG_LOG("hpkv_unlink(%s): Found %d chunks from metadata.\n", path, num_chunks);
-    } else {
-        DEBUG_LOG("hpkv_unlink(%s): Metadata not found. Assuming file doesn't exist or has no chunks.\n", path);
-        // If metadata doesn't exist, the file doesn't exist. Return ENOENT.
-        return -ENOENT;
-    }
-
-    // 2. Delete all chunk keys
-    for (int i = 0; i < num_chunks; ++i) {
-        int chunk_del_ret = delete_chunk_content(path, i);
-        if (chunk_del_ret != 0) {
-            fprintf(stderr, "Warning: hpkv_unlink(%s): Failed to delete chunk %d (FUSE %d). Continuing...\n", path, i, chunk_del_ret);
-            if (ret_chunks == 0) ret_chunks = chunk_del_ret; // Store first chunk deletion error
-        }
-    }
-
-    // 3. Delete the metadata key
-    get_meta_key(path, meta_key, sizeof(meta_key));
-    encoded_key = url_encode(meta_key);
-    if (!encoded_key || encoded_key[0] == '\0') {
-        fprintf(stderr, "Error: hpkv_unlink(%s): Failed to URL encode meta key.\n", path);
-        if (encoded_key) free(encoded_key);
-        return (ret_chunks != 0) ? ret_chunks : -EIO; // Return chunk error or EIO
-    }
-    snprintf(api_path_meta, sizeof(api_path_meta), "/record/%s", encoded_key);
-    free(encoded_key);
-
-    DEBUG_LOG("hpkv_unlink(%s): Performing DELETE request for metadata: %s\n", path, api_path_meta);
-    http_code_meta = perform_hpkv_request_with_retry("DELETE", api_path_meta, NULL, NULL, 0, &response_meta, 3);
-    if (response_meta.memory) {
-        free(response_meta.memory);
-        response_meta.memory = NULL;
-    }
-    ret_meta = map_http_to_fuse_error(http_code_meta);
-    if (ret_meta != 0 && ret_meta != -ENOENT) {
-        fprintf(stderr, "Warning: hpkv_unlink(%s): Failed DELETE for metadata %s, HTTP: %ld, FUSE: %d\n", path, meta_key, http_code_meta, ret_meta);
-    } else if (ret_meta == -ENOENT) {
-        ret_meta = 0; // Treat metadata not found as success if chunks were deleted (or didn't exist)
-    }
-
-    // Return success only if metadata delete succeeded (or ENOENT) AND chunk deletes succeeded (or ENOENT)
-    // Prioritize returning metadata error if it occurred.
-    int final_ret = (ret_meta != 0) ? ret_meta : ret_chunks;
-    DEBUG_LOG("hpkv_unlink: Finished for path: %s, returning %d\n", path, final_ret);
-    return final_ret;
-}
-
-// rename: Rename/move a file or directory (Modified for chunking)
-// Note: Still NOT atomic.
-static int hpkv_rename(const char *from, const char *to) {
-    DEBUG_LOG("hpkv_rename: Called from: %s, to: %s\n", from, to);
-    struct stat stbuf;
+    DEBUG_LOG("hpkv_unlink: Entered for path: %s\n", path);
     int ret = 0;
     json_t *meta_json = NULL;
     int num_chunks = 0;
+    char meta_key[1024];
 
-    // 1. Get attributes of the source
-    ret = hpkv_getattr(from, &stbuf);
-    if (ret != 0) return ret;
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_unlink(%s): Invalid FUSE context!\n", path);
+        return -EIO;
+    }
 
-    // 2. Check destination
-    struct stat stbuf_to;
-    int to_exists = (hpkv_getattr(to, &stbuf_to) == 0);
-    if (to_exists) {
-        if (S_ISDIR(stbuf.st_mode)) return -EEXIST;
-        if (S_ISDIR(stbuf_to.st_mode)) return -EISDIR;
-        ret = hpkv_unlink(to);
-        if (ret != 0) {
-            fprintf(stderr, "Error: hpkv_rename: Failed to delete existing destination file %s (%d).\n", to, ret);
-            return ret;
+    meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        DEBUG_LOG("hpkv_unlink(%s): File not found.\n", path);
+        return -ENOENT; // File doesn't exist
+    }
+
+    // Check if it's a directory (unlink shouldn't delete directories)
+    mode_t mode = (mode_t)json_integer_value(json_object_get(meta_json, "mode"));
+    if (S_ISDIR(mode)) {
+        json_decref(meta_json);
+        DEBUG_LOG("hpkv_unlink(%s): Attempted to unlink a directory.\n", path);
+        return -EISDIR; // Is a directory
+    }
+
+    num_chunks = (int)json_integer_value(json_object_get(meta_json, "num_chunks"));
+    json_decref(meta_json); // Done with metadata
+
+    // Delete all chunks
+    DEBUG_LOG("hpkv_unlink(%s): Deleting %d chunks.\n", path, num_chunks);
+    for (int i = 0; i < num_chunks; ++i) {
+        char chunk_key[1024];
+        get_chunk_key(path, i, chunk_key, sizeof(chunk_key));
+        // Ignore errors during chunk deletion? If metadata delete succeeds, file is effectively gone.
+        delete_hpkv_key(chunk_key);
+    }
+
+    // Delete metadata key
+    get_meta_key(path, meta_key, sizeof(meta_key));
+    DEBUG_LOG("hpkv_unlink(%s): Deleting metadata key %s.\n", path, meta_key);
+    ret = delete_hpkv_key(meta_key);
+
+    if (ret == 0) {
+        DEBUG_LOG("hpkv_unlink(%s): Successfully unlinked file.\n", path);
+    } else {
+        fprintf(stderr, "Error: hpkv_unlink(%s): Failed to delete metadata (Error %d).\n", path, ret);
+    }
+    return ret;
+}
+
+// NOTE: This rename is NOT ATOMIC.
+// It involves copying metadata, copying all chunks, then deleting old metadata/chunks.
+// An interruption could leave the filesystem in an inconsistent state.
+static int hpkv_rename(const char *from, const char *to) {
+    DEBUG_LOG("hpkv_rename: Entered from: %s, to: %s\n", from, to);
+    int ret = 0;
+    json_t *meta_json = NULL;
+    int num_chunks = 0;
+    char from_meta_key[1024], to_meta_key[1024];
+
+    struct fuse_context *context = fuse_get_context();
+    if (!context || !context->private_data) {
+        fprintf(stderr, "Error: hpkv_rename(%s -> %s): Invalid FUSE context!\n", from, to);
+        return -EIO;
+    }
+
+    // 1. Get metadata of the source
+    meta_json = get_metadata_json(from);
+    if (!meta_json) {
+        DEBUG_LOG("hpkv_rename(%s -> %s): Source path not found.\n", from, to);
+        return -ENOENT;
+    }
+    num_chunks = (int)json_integer_value(json_object_get(meta_json, "num_chunks"));
+
+    // 2. Check if destination exists (rename should overwrite files, fail for dirs?)
+    json_t *to_meta_json = get_metadata_json(to);
+    if (to_meta_json) {
+        mode_t to_mode = (mode_t)json_integer_value(json_object_get(to_meta_json, "mode"));
+        mode_t from_mode = (mode_t)json_integer_value(json_object_get(meta_json, "mode"));
+        json_decref(to_meta_json);
+
+        if (S_ISDIR(to_mode)) {
+            // Cannot overwrite a directory with a file/directory
+            DEBUG_LOG("hpkv_rename(%s -> %s): Destination is a directory.\n", from, to);
+            json_decref(meta_json);
+            return -EISDIR;
+        } else if (S_ISDIR(from_mode)) {
+             // Cannot rename a directory over a file
+             DEBUG_LOG("hpkv_rename(%s -> %s): Cannot rename directory over a file.\n", from, to);
+             json_decref(meta_json);
+             return -ENOTDIR;
+        } else {
+            // Overwriting a file, delete the destination first
+            DEBUG_LOG("hpkv_rename(%s -> %s): Destination file exists, deleting it first.\n", from, to);
+            ret = hpkv_unlink(to); // Use unlink to handle chunks
+            if (ret != 0) {
+                fprintf(stderr, "Error: hpkv_rename(%s -> %s): Failed to delete existing destination file (Error %d).\n", from, to, ret);
+                json_decref(meta_json);
+                return ret;
+            }
         }
     }
 
-    // 3. Copy metadata from 'from' to 'to'
-    DEBUG_LOG("hpkv_rename: Copying metadata from %s to %s\n", from, to);
-    meta_json = get_metadata_json(from);
-    if (!meta_json) {
-        fprintf(stderr, "Error: hpkv_rename: Failed to get metadata for source %s!\n", from);
-        return -EIO;
-    }
-    json_object_set_new(meta_json, "ctime", json_integer(time(NULL)));
-    // Get num_chunks for later use
-    json_t *j_val = json_object_get(meta_json, "num_chunks");
-    if (json_is_integer(j_val)) num_chunks = (int)json_integer_value(j_val);
-    
-    ret = post_metadata_json(to, meta_json); // Takes ownership of meta_json
-    meta_json = NULL; // Avoid double decref
+    // 3. Post the metadata to the new path
+    // Update ctime for the rename operation itself
+    time_t now = time(NULL);
+    json_object_set(meta_json, "ctime", json_integer(now));
+    ret = post_metadata_json(to, meta_json);
     if (ret != 0) {
-        fprintf(stderr, "Error: hpkv_rename: Failed to post metadata for destination %s (%d).\n", to, ret);
+        fprintf(stderr, "Error: hpkv_rename(%s -> %s): Failed to post metadata to destination (Error %d).\n", from, to, ret);
+        json_decref(meta_json);
         return ret;
     }
 
-    // 4. If it's a file, copy chunks from 'from' to 'to'
-    if (S_ISREG(stbuf.st_mode)) {
-        DEBUG_LOG("hpkv_rename: Source %s is a file with %d chunks. Copying chunks to %s\n", from, num_chunks, to);
-        for (int i = 0; i < num_chunks; ++i) {
-            size_t chunk_len = 0;
-            char *chunk_content = get_chunk_content(from, i, &chunk_len);
-            if (chunk_content) {
-                DEBUG_LOG("hpkv_rename: Copying chunk %d (len %zu) from %s to %s\n", i, chunk_len, from, to);
-                ret = post_chunk_content(to, i, chunk_content, chunk_len);
-                free(chunk_content);
-                if (ret != 0) {
-                    fprintf(stderr, "Error: hpkv_rename: Failed to post chunk %d to destination %s (%d).\n", i, to, ret);
-                    hpkv_unlink(to); // Attempt cleanup of destination
-                    return ret;
-                }
-            } else {
-                // If a source chunk is missing, should we create an empty one at dest or fail?
-                fprintf(stderr, "Warning: hpkv_rename: Failed to get chunk %d from source %s during rename. Skipping chunk copy.\n", i, from);
-                // Let's skip copying this chunk, the destination might be incomplete.
+    // 4. Copy all chunks from source path to destination path
+    DEBUG_LOG("hpkv_rename(%s -> %s): Copying %d chunks.\n", from, to, num_chunks);
+    for (int i = 0; i < num_chunks; ++i) {
+        struct MemoryStruct chunk_data = get_chunk_content(from, i);
+        if (chunk_data.memory) {
+            ret = post_chunk_content(to, i, chunk_data.memory, chunk_data.size);
+            free(chunk_data.memory);
+            if (ret != 0) {
+                fprintf(stderr, "Error: hpkv_rename(%s -> %s): Failed to post chunk %d to destination (Error %d).\n", from, to, i, ret);
+                // Attempt to clean up partially copied data?
+                hpkv_unlink(to); // Try to delete the partially renamed file
+                json_decref(meta_json);
+                return ret;
             }
+        } else {
+            // Chunk missing from source? Log warning but continue?
+            fprintf(stderr, "Warning: hpkv_rename(%s -> %s): Source chunk %d missing or failed to read.\n", from, to, i);
+            // If we continue, the renamed file might be corrupted.
+            // Let's abort here for safety.
+            hpkv_unlink(to); // Try to delete the partially renamed file
+            json_decref(meta_json);
+            return -EIO;
         }
+    }
+
+    // 5. Delete the old metadata and chunks
+    DEBUG_LOG("hpkv_rename(%s -> %s): Deleting original file/directory.\n", from, to);
+    // Use unlink for files, rmdir for directories (based on original mode)
+    mode_t from_mode = (mode_t)json_integer_value(json_object_get(meta_json, "mode"));
+    if (S_ISDIR(from_mode)) {
+         ret = hpkv_rmdir(from);
     } else {
-         DEBUG_LOG("hpkv_rename: Source %s is a directory. Renaming metadata only.\n", from);
+         ret = hpkv_unlink(from);
+    }
+    // Ignore delete errors? If copy succeeded, rename is effectively done.
+    if (ret != 0) {
+         fprintf(stderr, "Warning: hpkv_rename(%s -> %s): Failed to delete original path (Error %d), but copy succeeded.\n", from, to, ret);
+         ret = 0; // Report success as the 'to' path now exists
     }
 
-    // 5. Delete the old metadata and chunks (if file)
-    DEBUG_LOG("hpkv_rename: Deleting original path %s\n", from);
-    // We need to pass the original num_chunks to unlink
-    // Re-reading metadata just before unlink is safer in case of interruption
-    int unlink_ret = hpkv_unlink(from); 
-    if (unlink_ret != 0) {
-        fprintf(stderr, "Warning: hpkv_rename: Failed to delete original path %s after renaming (%d). Destination %s might be a duplicate.\n", from, unlink_ret, to);
-        // Don't return error for the rename itself, but log warning.
-    }
-
-    DEBUG_LOG("hpkv_rename: Finished from %s to %s, returning %d\n", from, to, ret);
-    return ret; // Return 0 if copy succeeded, even if cleanup failed
+    json_decref(meta_json);
+    DEBUG_LOG("hpkv_rename(%s -> %s): Rename successful (non-atomic).\n", from, to);
+    return ret;
 }
 
-// chmod: Change file permissions (unchanged)
+// Helper function to update specific metadata fields
+static int update_metadata_field(const char *path, const char *field_name, json_t *new_value) {
+    int ret = 0;
+    json_t *meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        return -ENOENT;
+    }
+
+    // Update the specific field
+    json_object_set(meta_json, field_name, new_value); // Note: Steals reference to new_value
+
+    // Update ctime as metadata is changing
+    time_t now = time(NULL);
+    json_object_set_new(meta_json, "ctime", json_integer(now));
+    // Optionally update mtime for chmod/chown?
+    // json_object_set_new(meta_json, "mtime", json_integer(now));
+
+    ret = post_metadata_json(path, meta_json);
+    json_decref(meta_json);
+    return ret;
+}
+
 static int hpkv_chmod(const char *path, mode_t mode) {
-    DEBUG_LOG("hpkv_chmod: Called for path: %s, mode: %o\n", path, mode);
-    json_t *meta_json = NULL;
-    int ret = 0;
-
-    meta_json = get_metadata_json(path);
-    if (!meta_json) return -ENOENT;
-
-    mode_t current_mode = 0;
-    json_t *j_val = json_object_get(meta_json, "mode");
-    if (json_is_integer(j_val)) current_mode = (mode_t)json_integer_value(j_val);
-    else current_mode = S_IFREG | 0644; 
-
-    mode_t new_mode = (current_mode & S_IFMT) | (mode & ~S_IFMT);
-    json_object_set_new(meta_json, "mode", json_integer(new_mode));
-    json_object_set_new(meta_json, "ctime", json_integer(time(NULL)));
-
-    ret = post_metadata_json(path, meta_json);
-    DEBUG_LOG("hpkv_chmod: Finished for path: %s, returning %d\n", path, ret);
-    return ret;
+    DEBUG_LOG("hpkv_chmod: Entered for path: %s, mode: %o\n", path, mode);
+    // We only care about the permission bits, not the file type bits
+    return update_metadata_field(path, "mode", json_integer(mode & 0777));
 }
 
-// chown: Change file owner/group (unchanged)
 static int hpkv_chown(const char *path, uid_t uid, gid_t gid) {
-    DEBUG_LOG("hpkv_chown: Called for path: %s, uid: %d, gid: %d\n", path, (int)uid, (int)gid);
-    json_t *meta_json = NULL;
+    DEBUG_LOG("hpkv_chown: Entered for path: %s, uid: %d, gid: %d\n", path, uid, gid);
     int ret = 0;
+    json_t *meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        return -ENOENT;
+    }
 
-    meta_json = get_metadata_json(path);
-    if (!meta_json) return -ENOENT;
+    // Update uid and gid
+    // Only update if value is not -1 (convention for "don't change")
+    if (uid != (uid_t)-1) {
+        json_object_set(meta_json, "uid", json_integer(uid));
+    }
+    if (gid != (gid_t)-1) {
+        json_object_set(meta_json, "gid", json_integer(gid));
+    }
 
-    if (uid != (uid_t)-1) json_object_set_new(meta_json, "uid", json_integer(uid));
-    if (gid != (gid_t)-1) json_object_set_new(meta_json, "gid", json_integer(gid));
-    json_object_set_new(meta_json, "ctime", json_integer(time(NULL)));
+    // Update ctime
+    time_t now = time(NULL);
+    json_object_set_new(meta_json, "ctime", json_integer(now));
 
     ret = post_metadata_json(path, meta_json);
-    DEBUG_LOG("hpkv_chown: Finished for path: %s, returning %d\n", path, ret);
+    json_decref(meta_json);
     return ret;
 }
 
-// utimens: Change file access/modification times (unchanged)
 static int hpkv_utimens(const char *path, const struct timespec ts[2]) {
-    DEBUG_LOG("hpkv_utimens: Called for path: %s\n", path);
-    json_t *meta_json = NULL;
+    DEBUG_LOG("hpkv_utimens: Entered for path: %s\n", path);
     int ret = 0;
+    json_t *meta_json = get_metadata_json(path);
+    if (!meta_json) {
+        return -ENOENT;
+    }
 
-    meta_json = get_metadata_json(path);
-    if (!meta_json) return -ENOENT;
+    // Update atime and mtime from timespec array
+    // ts[0] is access time, ts[1] is modification time
+    json_object_set(meta_json, "atime", json_integer(ts[0].tv_sec));
+    json_object_set(meta_json, "mtime", json_integer(ts[1].tv_sec));
 
-    if (ts[0].tv_nsec != UTIME_OMIT) json_object_set_new(meta_json, "atime", json_integer(ts[0].tv_sec));
-    if (ts[1].tv_nsec != UTIME_OMIT) json_object_set_new(meta_json, "mtime", json_integer(ts[1].tv_sec));
-    json_object_set_new(meta_json, "ctime", json_integer(time(NULL)));
+    // Update ctime
+    time_t now = time(NULL);
+    json_object_set_new(meta_json, "ctime", json_integer(now));
 
     ret = post_metadata_json(path, meta_json);
-    DEBUG_LOG("hpkv_utimens: Finished for path: %s, returning %d\n", path, ret);
+    json_decref(meta_json);
     return ret;
 }
 
-// --- FUSE Setup ---
+// --- FUSE Operations Struct ---
 
 static struct fuse_operations hpkv_oper = {
-    .getattr   = hpkv_getattr,
-    .readdir   = hpkv_readdir,
-    .mkdir     = hpkv_mkdir,
-    .rmdir     = hpkv_rmdir,
-    .create    = hpkv_create,
-    .open      = hpkv_open,
-    .read      = hpkv_read,
-    .write     = hpkv_write,
-    .truncate  = hpkv_truncate,
-    .unlink    = hpkv_unlink,
-    .rename    = hpkv_rename,
-    .chmod     = hpkv_chmod,
-    .chown     = hpkv_chown,
-    .utimens   = hpkv_utimens,
-    // Add other operations as needed (e.g., symlink, link, statfs)
+    .getattr    = hpkv_getattr,
+    .readdir    = hpkv_readdir,
+    .mkdir      = hpkv_mkdir,
+    .rmdir      = hpkv_rmdir,
+    .create     = hpkv_create,
+    .open       = hpkv_open,
+    .read       = hpkv_read,
+    .write      = hpkv_write,
+    .truncate   = hpkv_truncate,
+    .unlink     = hpkv_unlink,
+    .rename     = hpkv_rename,
+    .chmod      = hpkv_chmod,
+    .chown      = hpkv_chown,
+    .utimens    = hpkv_utimens,
 };
 
-// Define command line options
-#define HPKV_OPT(t, p, v) { t, offsetof(struct hpkv_options, p), v }
+// --- Main Function & Option Parsing ---
+
+#define HPKV_OPT_KEY(t, p, v) { t, offsetof(struct hpkv_options, p), v }
 
 static struct fuse_opt hpkv_opts[] = {
-    HPKV_OPT("--api-url=%s", api_base_url, 0),
-    HPKV_OPT("--api-key=%s", api_key, 0),
+    HPKV_OPT_KEY("--api-url=%s", api_base_url, 0),
+    HPKV_OPT_KEY("--api-key=%s", api_key, 0),
     FUSE_OPT_END
 };
 
-// Option parsing callback for FUSE
-static int hpkv_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs) {
-    (void) data; (void) outargs; (void) arg;
-    switch (key) {
-        case FUSE_OPT_KEY_OPT: return 1;
-        case FUSE_OPT_KEY_NONOPT: return 1;
-        default: return 0;
-    }
-}
-
 int main(int argc, char *argv[]) {
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-    struct hpkv_options options = {0};
-    hpkv_config config = {0};
+    struct hpkv_options options;
     int ret;
 
-    fprintf(stderr, "Starting HPKV FUSE filesystem (hpkvfs v0.1.3 - readdir fix).\n");
+    // Initialize options
+    memset(&options, 0, sizeof(options));
 
-    if (fuse_opt_parse(&args, &options, hpkv_opts, hpkv_opt_proc) == -1) {
-        fprintf(stderr, "Error: Failed to parse FUSE options.\n");
+    // Parse command line options
+    if (fuse_opt_parse(&args, &options, hpkv_opts, NULL) == -1) {
+        fprintf(stderr, "Error: Failed to parse FUSE options\n");
         return 1;
     }
+
+    // Check required options
     if (!options.api_base_url || !options.api_key) {
-        fprintf(stderr, "Error: --api-url and --api-key are required.\nUsage: %s <mountpoint> --api-url=<url> --api-key=<key> [FUSE options]\n", argv[0]);
+        fprintf(stderr, "Error: --api-url and --api-key are required.\n");
+        fprintf(stderr, "Usage: %s <mountpoint> --api-url=<url> --api-key=<key> [FUSE options]\n", argv[0]);
         fuse_opt_free_args(&args);
         return 1;
     }
 
-    config.api_base_url = strdup(options.api_base_url);
-    config.api_key = strdup(options.api_key);
-    if (!config.api_base_url || !config.api_key) {
-        fprintf(stderr, "Error: Failed to allocate memory for config.\n");
-        if (config.api_base_url) free(config.api_base_url);
-        if (config.api_key) free(config.api_key);
-        fuse_opt_free_args(&args);
-        return 1;
+    // Store config globally for early init check
+    global_hpkv_config.api_base_url = strdup(options.api_base_url);
+    global_hpkv_config.api_key = strdup(options.api_key);
+    if (!global_hpkv_config.api_base_url || !global_hpkv_config.api_key) {
+         fprintf(stderr, "Error: Failed to duplicate API config strings.\n");
+         if (global_hpkv_config.api_base_url) free(global_hpkv_config.api_base_url);
+         if (global_hpkv_config.api_key) free(global_hpkv_config.api_key);
+         fuse_opt_free_args(&args);
+         return 1;
     }
 
-    fprintf(stderr, "  API URL: %s\n", config.api_base_url);
-    fprintf(stderr, "  Chunk Size: %d bytes\n", HPKV_CHUNK_SIZE);
-
+    // Initialize libcurl globally
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    fprintf(stderr, "Mounting filesystem...\n");
 
-    ret = fuse_main(args.argc, args.argv, &hpkv_oper, &config);
+    // --- Automatic Root Initialization Check ---
+    fprintf(stdout, "Starting HPKV FUSE filesystem (hpkvfs v0.1.4 - auto-root).\n");
+    fprintf(stdout, "  API URL: %s\n", global_hpkv_config.api_base_url);
+    ret = ensure_root_metadata_exists();
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to ensure root directory metadata exists (Error %d). Aborting.\n", ret);
+        curl_global_cleanup();
+        free(global_hpkv_config.api_base_url);
+        free(global_hpkv_config.api_key);
+        fuse_opt_free_args(&args);
+        return 1;
+    }
+    // --- End Automatic Root Initialization ---
 
-    fprintf(stderr, "Filesystem unmounted. Exiting with status %d.\n", ret);
+    fprintf(stdout, "Mounting filesystem...\n");
 
+    // Pass the config to FUSE's private_data
+    ret = fuse_main(args.argc, args.argv, &hpkv_oper, &global_hpkv_config);
+
+    // Cleanup
     curl_global_cleanup();
-    free(config.api_base_url);
-    free(config.api_key);
+    free(global_hpkv_config.api_base_url);
+    free(global_hpkv_config.api_key);
     fuse_opt_free_args(&args);
 
     return ret;

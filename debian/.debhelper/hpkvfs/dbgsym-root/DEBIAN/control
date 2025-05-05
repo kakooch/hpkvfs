@@ -1,13 +1,13 @@
 Package: hpkvfs-dbgsym
 Package-Type: ddeb
 Source: hpkvfs
-Version: 0.1.3-1
+Version: 0.1.3-2
 Auto-Built-Package: debug-symbols
 Architecture: amd64
 Maintainer: Kaveh Kakooch <kakooch@gmail.com>
-Installed-Size: 75
-Depends: hpkvfs (= 0.1.3-1)
+Installed-Size: 76
+Depends: hpkvfs (= 0.1.3-2)
 Section: debug
 Priority: optional
 Description: debug symbols for hpkvfs
-Build-Ids: 545cbe95f939468f41eb18c1d640f6b63d9f96b1
+Build-Ids: 5238f97c2404c6013d0586763cf2239c6bc65afb
