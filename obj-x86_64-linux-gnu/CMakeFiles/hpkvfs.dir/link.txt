@@ -1,0 +1,1 @@
+/usr/bin/cc -g -O2 -ffile-prefix-map=/home/ubuntu/hpkvfs-0.1.3=. -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -flto=auto -Wl,-z,relro CMakeFiles/hpkvfs.dir/hpkvfs.c.o -o hpkvfs  -lfuse -lcurl -ljansson 

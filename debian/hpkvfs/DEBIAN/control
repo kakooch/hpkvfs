@@ -1,0 +1,23 @@
+Package: hpkvfs
+Version: 0.1.3-1
+Architecture: amd64
+Maintainer: Kaveh Kakooch <kakooch@gmail.com>
+Installed-Size: 64
+Depends: libc6 (>= 2.34), libcurl4 (>= 7.16.2), libfuse2 (>= 2.8), libjansson4 (>= 2.7), fuse
+Section: utils
+Priority: optional
+Homepage: https://github.com/kakooch/hpkvfs
+Description: Mount your hpkv.io as a disk
+ `hpkvfs` is a filesystem driver implemented using FUSE (Filesystem in Userspace)
+ that allows you to mount a HPKV (High-Performance Key-Value) Store bucket
+ as a standard filesystem. It interacts with the HPKV REST API to perform
+ filesystem operations, translating file and directory actions into key-value
+ operations.
+ .
+ This enables accessing and manipulating data stored in HPKV using standard
+ command-line tools (`ls`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `echo`, etc.) and
+ applications, providing a familiar interface to a powerful key-value storage
+ backend.
+ .
+ Features include file chunking for large files, standard filesystem
+ operations, metadata storage, error handling, and retry logic.

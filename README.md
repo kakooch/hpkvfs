@@ -8,11 +8,11 @@
 
 This enables accessing and manipulating data stored in HPKV using standard command-line tools (`ls`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `echo`, etc.) and applications, providing a familiar interface to a powerful key-value storage backend.
 
-**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. File operations (read, write, create, delete) appear functional based on user testing. Fixed an issue in `readdir` that caused `ls` to fail with an "Input/output error" by preventing empty entry names from being added. Further testing is recommended.
+**Current Status:** Implemented file chunking to support files larger than the HPKV API's 3KB value limit. File operations (read, write, create, delete) appear functional based on user testing. Fixed an issue in `readdir` that caused `ls` to fail with an "Input/output error" by preventing empty entry names from being added. Packaged for Debian/Ubuntu (`.deb`). Further testing is recommended.
 
 ## Platform Support
 
-*   **Linux (Primary & Tested):** Developed and tested primarily on Linux (Ubuntu). Requires `libfuse`.
+*   **Linux (Primary & Tested):** Developed and tested primarily on Linux (Ubuntu). Requires `libfuse`. `.deb` package available for Ubuntu 22.04 (Jammy) and derivatives.
 *   **macOS (Experimental):** Includes experimental support for macOS. Requires [macFUSE](https://osxfuse.github.io/) (the successor to FUSE for macOS). Build and runtime behavior are **experimental and not guaranteed**.
 *   **Windows (Unsupported):** Windows is **not currently supported**. The FUSE API is not native to Windows. Porting this project would require significant effort to use a compatibility layer like [Dokan](https://dokan-dev.github.io/) or [WinFsp](https://winfsp.dev/).
 
@@ -42,44 +42,64 @@ This enables accessing and manipulating data stored in HPKV using standard comma
 *   **Retry Logic:** Implements basic retry logic with exponential backoff for transient API errors (e.g., rate limits, server errors).
 *   **CMake Build System:** Uses CMake for cross-platform building (Linux, experimental macOS).
 *   **Build Script:** Includes a simple `build.sh` script for convenience on Unix-like systems.
+*   **Debian Packaging:** Includes configuration for building `.deb` packages for Debian/Ubuntu.
 
 ## Dependencies
 
-To build and run `hpkvfs`, you need the following development packages:
+**Runtime Dependencies (for using the installed package or binary):**
+*   `fuse`: The FUSE runtime library and utilities.
+*   `libcurl4`: The cURL library for HTTP requests.
+*   `libjansson4`: The Jansson library for JSON parsing.
+
+**Build Dependencies (for building from source):**
 
 **Common:**
 1.  **`cmake`:** Cross-platform build system generator (>= 3.10).
 2.  **`pkg-config`:** Helper tool to get compiler/linker flags.
-3.  **`libcurl`:** Development files for the cURL library (used for HTTP requests).
-4.  **`jansson`:** Development files for the Jansson library (used for JSON parsing).
+3.  **`libcurl4-openssl-dev`** (or similar): Development files for the cURL library.
+4.  **`libjansson-dev`:** Development files for the Jansson library.
 5.  **A C Compiler:** Such as `gcc` or `clang`.
 6.  **Build Tools:** `make` or `ninja-build`.
 
 **Platform-Specific:**
-*   **Linux:** `libfuse-dev` (or `fuse-devel` on some distributions), `fuse` runtime package.
+*   **Linux:** `libfuse-dev` (or `fuse-devel` on some distributions).
 *   **macOS (Experimental):** [macFUSE](https://osxfuse.github.io/) (install the SDK and runtime). Dependencies like `curl` and `jansson` are typically installed via [Homebrew](https://brew.sh/) (`brew install curl jansson pkg-config cmake`).
 
-**Installation Examples:**
+**Debian/Ubuntu Build Environment Setup:**
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config fuse libfuse-dev libcurl4-openssl-dev libjansson-dev debhelper devscripts dh-make
+```
 
-*   **Debian/Ubuntu:**
+## Installation (Debian/Ubuntu)
+
+**Using the `.deb` Package:**
+
+If you have the `hpkvfs_*.deb` package file:
+
+1.  **Install the package:**
     ```bash
-    sudo apt-get update
-    sudo apt-get install -y cmake pkg-config fuse libfuse-dev libcurl4-openssl-dev libjansson-dev build-essential
+    sudo dpkg -i hpkvfs_*.deb
     ```
-*   **macOS (using Homebrew):**
-    1.  Install [macFUSE](https://osxfuse.github.io/) (download from website).
-    2.  Install build tools and libraries:
-        ```bash
-        brew install cmake pkg-config curl jansson
-        ```
+2.  **Fix Dependencies (if necessary):** If `dpkg` reports missing dependencies, run:
+    ```bash
+    sudo apt-get install -f
+    ```
+    This will automatically install `fuse`, `libcurl4`, and `libjansson4` if they are not already present.
 
-## Building
+**Using an APT Repository (Recommended - Requires Setup):**
+
+For easier installation and updates, it's recommended to host the `.deb` package in a Personal Package Archive (PPA) on Launchpad or create your own custom APT repository.
+
+*(Instructions for adding and using a specific PPA or repository would go here once available.)*
+
+## Building from Source
 
 This project uses CMake. You can use the provided build script or follow the manual CMake steps.
 
 **Using the Build Script (Recommended on Linux/macOS):**
 
-1.  **Ensure Dependencies:** Make sure all dependencies listed above are installed.
+1.  **Ensure Dependencies:** Make sure all **Build Dependencies** listed above are installed.
 2.  **Run the Script:** Execute the `build.sh` script from the project's root directory.
     ```bash
     ./build.sh
@@ -88,40 +108,29 @@ This project uses CMake. You can use the provided build script or follow the man
 
 **Manual CMake Steps:**
 
-1.  **Create a build directory:** It's best practice to build outside the source directory.
+1.  **Create a build directory:**
     ```bash
     mkdir build
     cd build
     ```
-
-2.  **Configure using CMake:** Run CMake to configure the project and generate build files (e.g., Makefiles or Ninja files).
+2.  **Configure using CMake:**
     ```bash
-    # On Linux/macOS:
     cmake .. 
-    
-    # Optional: Specify installation prefix
-    # cmake .. -DCMAKE_INSTALL_PREFIX=/path/to/install
-    
-    # Optional: Specify generator (e.g., for Ninja)
-    # cmake .. -G Ninja
     ```
-    CMake will detect the operating system and attempt to find the required dependencies (libfuse/macFUSE, libcurl, jansson).
-
-3.  **Compile:** Run the build tool (e.g., `make` or `ninja`).
+3.  **Compile:**
     ```bash
     make 
-    # or
-    # ninja
     ```
-    This will create the `hpkvfs` executable in the `build` directory.
+    The `hpkvfs` executable will be in the `build` directory.
 
-4.  **(Optional) Install:** To install the `hpkvfs` binary to the configured installation path (default: `/usr/local/bin` on Unix-like systems), run:
+**Building the `.deb` Package (Debian/Ubuntu):**
+
+1.  **Ensure Dependencies:** Install all **Build Dependencies** including the Debian packaging tools (`debhelper`, `devscripts`, `dh-make`).
+2.  **Build the Package:** From the project's root directory, run:
     ```bash
-    sudo make install
-    # or
-    # sudo ninja install
+    dpkg-buildpackage -us -uc
     ```
-    *Note: Installation is not configured for Windows.* 
+    This will create the `hpkvfs_*.deb` package in the parent directory (`../`).
 
 ## Usage
 
@@ -141,27 +150,17 @@ This project uses CMake. You can use the provided build script or follow the man
     (Replace UID/GID/timestamps as needed. The value must be a JSON *string* when using the API directly).
 4.  **Mount:** Run `hpkvfs` with the mount point, API key, and API URL.
     ```bash
-    # From build directory:
+    # If installed via .deb package:
+hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
+    # If built from source:
     ./build/hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
-    # If installed:
-    hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
     ```
 5.  **Unmount:**
     *   Foreground (`-f`): Press `Ctrl+C`.
     *   Background: `fusermount -u ~/my_hpkv_drive`
 
 **macOS (Experimental):**
-1.  **Install macFUSE:** Ensure macFUSE is installed and kernel extension is allowed.
-2.  **Create Mount Point:** `mkdir ~/my_hpkv_drive`
-3.  **Initialize Root:** See step 3 under Linux usage.
-4.  **Mount:** Similar to Linux, using the compiled `hpkvfs` binary.
-    ```bash
-    ./build/hpkvfs ~/my_hpkv_drive --api-key=<YOUR_HPKV_API_KEY> --api-url=<YOUR_HPKV_API_URL> [FUSE options]
-    ```
-    *Note: Standard FUSE options like `-o allow_other` might require specific macFUSE configuration.* 
-5.  **Unmount:**
-    *   Foreground (`-f`): Press `Ctrl+C`.
-    *   Background: `umount ~/my_hpkv_drive` or `diskutil unmount ~/my_hpkv_drive`
+*(Usage similar to Linux, but requires building from source and using macFUSE)*
 
 **Common FUSE Options:**
 *   `-f`: Run in the foreground (useful for debugging).
@@ -175,7 +174,7 @@ This project uses CMake. You can use the provided build script or follow the man
 
 **Example:**
 ```bash
-./build/hpkvfs ~/my_hpkv_drive --api-key=d2e022c1d3b94b3180f5179da422d437 --api-url=https://api-eu-1.hpkv.io -f -d
+hpkvfs ~/my_hpkv_drive --api-key=d2e022c1d3b94b3180f5179da422d437 --api-url=https://api-eu-1.hpkv.io -f
 ```
 
 ## Design & Implementation

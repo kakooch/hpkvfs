@@ -1,0 +1,7 @@
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/hpkvfs.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/edit_cache.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/rebuild_cache.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/list_install_components.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/install.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/install/local.dir
+/home/ubuntu/hpkvfs-0.1.3/obj-x86_64-linux-gnu/CMakeFiles/install/strip.dir
